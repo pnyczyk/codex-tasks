@@ -202,7 +202,7 @@ Poniższa lista zawiera wszystkie warianty (wartość pola `type` → payload):
 - `task_started` → `{ "model_context_window": u64? }`
 - `task_complete` → `{ "last_agent_message": String? }`
 - `token_count` → `{ "info": TokenUsageInfo? }`
-- `turn_aborted` → `{ "reason": "interrupted" | "replaced" }`
+- `turn_aborted` → `{ "reason": "interrupted" | "replaced" | "review_ended" }`
 - `shutdown_complete` → brak pól (pusty obiekt)
 - `stream_error` → `{ "message": String }`
 - `background_event` → `{ "message": String }`
@@ -326,7 +326,7 @@ Wartości `type`: `read`, `list_files`, `search`, `unknown`. Pola:
 `FunctionCallOutputPayload` serializuje się jako zwykły string (`content`). `success` służy tylko lokalnie.
 
 ### Local shell
-- `LocalShellAction::Exec { command: [String], timeout_ms?: u64, working_directory?: String, env?: {k:v}, user?: String }`
+- `LocalShellAction::Exec { command: [String], timeout_ms?: u64 (alias: timeout), working_directory?: String, env?: {k:v}, user?: String, with_escalated_permissions?: bool, justification?: String }`
 - `LocalShellStatus`: `completed`, `in_progress`, `incomplete`.
 
 ### Web search
@@ -399,7 +399,8 @@ Patrz sekcja [Plan tool](#plan-tool-updateplanargs). Umożliwia spójne aktualiz
 
 ### Konfiguracja użytkownika (`UserSavedConfig`)
 - Pola opcjonalne opisują preferowane ustawienia (policy, sandbox, model, profile, narzędzia).
-- `profiles` to mapa `profil -> Profile { model?, model_provider?, approval_policy?, model_reasoning_*?, chatgpt_base_url? }`.
+- `approval_policy?`, `sandbox_mode?`, `sandbox_settings?`, `model?`, `model_reasoning_effort?`, `model_reasoning_summary?`, `model_verbosity?`, `tools?`, `profile?`, `profiles`.
+- `profiles` to mapa `profil -> Profile { model?, model_provider?, approval_policy?, model_reasoning_*?, model_verbosity?, chatgpt_base_url? }`.
 - `tools`: `web_search?`, `view_image?` (bool).
 - `sandbox_settings`: jak w `SandboxPolicy::WorkspaceWrite`.
 
@@ -417,7 +418,7 @@ Patrz sekcja [Plan tool](#plan-tool-updateplanargs). Umożliwia spójne aktualiz
 
 ## Przebieg tury (SQ/EQ)
 1. **Submission**: klient publikuje `Submission` (`user_turn` lub `user_input`).
-2. **Echo input**: agent wysyła `EventMsg::UserMessage` (co zostało przekazane modelowi) oraz `SessionConfigured` przy starcie.
+2. **Echo input**: agent wysyła `EventMsg::UserMessage` (co zostało przekazane modelowi) oraz `SessionConfigured` przy starcie. Wyjątek: w trybie review syntetyczna wiadomość startowa (powstała z `Op::Review`) nie jest emitowana jako `UserMessage`; interfejs dostaje tylko `EnteredReviewMode`.
 3. **Stream reasoning**: `AgentMessageDelta`, `AgentReasoningDelta`, `TokenCount` itd. pojawiają się asynchronicznie.
 4. **Narzędzia**: gdy model uruchamia polecenia lub narzędzia MCP, pojawiają się `ExecCommand*`, `McpToolCall*`, `WebSearch*`, `PlanUpdate`.
 5. **Zgody**: jeżeli konieczna zgoda użytkownika, agent wysyła `ExecApprovalRequest` / `ApplyPatchApprovalRequest`. Klient musi odpowiedzieć `exec_approval` / `patch_approval`.
