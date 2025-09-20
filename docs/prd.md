@@ -1,0 +1,109 @@
+# Product Requirements – `codex-tasks`
+
+## 1. Overview
+`codex-tasks` is a standalone CLI for launching and managing multiple Codex sessions in the background. Each session ("task") runs as its own helper process built on the existing `codex-task` implementation. The helper process is responsible for starting `codex proto`, streaming and rendering its transcript, and maintaining a simple filesystem-based “database” under `~/.codex/tasks`.
+
+## 2. Goals
+- Allow users to start Codex jobs that continue running after the CLI exits.
+- Provide lightweight commands to send additional prompts, inspect results, and stop/archive tasks.
+- Preserve the existing transcript formatting, shutdown semantics, and UTF-8 handling from `codex-task`.
+- Avoid a central daemon; each task is self-contained in its own process with a small set of files.
+
+## 3. CLI surface
+```
+codex-tasks start [-t <title>] [prompt]
+codex-tasks send <task_id> <prompt>
+codex-tasks status <task_id>
+codex-tasks stop <task_id>
+codex-tasks ls [--state <STATE> ...]
+codex-tasks archive <task_id>
+```
+### 3.1 `start`
+- Generate a new UUID (`task_id`).
+- Create task files in `~/.codex/tasks/` (`pid`, `pipe`, `log`, `result`).
+- Fork a helper process (the “task worker”).
+  - Worker launches `codex proto`, reusing the current `codex-task` I/O pipeline.
+  - If an initial prompt is provided, send it immediately.
+- Return `task_id` to stdout.
+
+### 3.2 `send`
+- Resolve the task directory and open `<task_id>.pipe`.
+- Write the prompt (newline-terminated UTF-8) so the worker can forward it to Codex.
+
+### 3.3 `status`
+- Inspect the task files and process state.
+- Determine status (`IDLE`, `RUNNING`, `STOPPED`, `ARCHIVED`, `DIED`).
+- Output JSON or table with status, title (if any), timestamps, and last result (if available).
+
+### 3.4 `stop`
+- Notify the worker to send `shutdown` to Codex, wait for `ShutdownComplete`, and clean up (`.pid`, `.pipe`).
+- After graceful exit, status becomes `STOPPED`.
+
+### 3.5 `ls`
+- List all tasks in `~/.codex/tasks/` plus archived entries in `done/YYYY/MM/DD/`.
+- Optional `--state` filters (multiple allowed).
+
+### 3.6 `archive`
+- Move task files into `done/<YYYY>/<MM>/<DD>/<task_id>/`.
+- Status becomes `ARCHIVED`.
+
+## 4. Task data model
+- `task_id`: UUID (e.g., `7df7c873-...`).
+- `title`: optional string provided at `start`.
+- `state`: one of {`IDLE`, `RUNNING`, `STOPPED`, `ARCHIVED`, `DIED`}.
+- `created_at`, `updated_at` timestamps (recorded by worker).
+- `last_result`: UTF-8 text of the most recent Codex answer (available in `IDLE`, `STOPPED`, `ARCHIVED`).
+
+## 5. Filesystem layout (`~/.codex/tasks/`)
+```
+~/.codex/tasks/
+  <task_id>.pid       # PID of worker process
+  <task_id>.pipe      # FIFO for prompts
+  <task_id>.log       # rendered transcript
+  <task_id>.result    # latest result (if any)
+  meta.json?          # optional metadata cache (future work)
+  done/<YYYY>/<MM>/<DD>/<task_id>/...  # archived copies of the above files
+```
+- When a task is STOPPED or DIED, `.pid` and `.pipe` are removed; log/result remain.
+- LOG format matches current `codex-task` output (timestamps, headings, reasoning blocks, etc.).
+
+## 6. Worker lifecycle
+1. **Spawn**: parent CLI forks a worker, writes initial files, and returns `task_id`.
+2. **Initialization**: worker launches `codex proto` with piped stdin/stdout, replicating existing `codex-task` logic.
+3. **Main loop**:
+   - Read user prompts from `<task_id>.pipe` (line/segment-based). Each prompt triggers `RUNNING` → `IDLE` transitions.
+   - Forward Codex events to the renderer, appending to `<task_id>.log` and updating `<task_id>.result` when appropriate.
+4. **Shutdown**:
+   - On `stop` or EOF on pipe, send `{"id":"sub-…","op":{"type":"shutdown"}}` (same as current implementation).
+   - Wait for `ShutdownComplete`; close pipes; kill process on timeout (5 s) with logging.
+5. **Termination**: remove `.pid`/`.pipe`. If exit was graceful → `STOPPED`; if worker dies unexpectedly → `DIED`.
+
+## 7. State transitions
+```
+(start) → IDLE or RUNNING (if prompt) ↔ RUNNING (during codex call)
+RUNNING → IDLE (on successful completion)
+stop → STOPPED (after graceful shutdown)
+worker crash / missing PID → DIED
+archive → ARCHIVED (files moved to done/…)
+```
+
+## 8. Error handling & logging
+- All Codex interaction logs go to `<task_id>.log` (exact renderer from `codex-task`).
+- `status` detects:
+  - Missing `.pid` but existing `.log` ⇒ `DIED`.
+  - Archived tasks based on directory location.
+- CLI commands exit non-zero with a clear message if:
+  - Task ID not found.
+  - Pipe missing (STOPPED/ARCHIVED tasks) unless command is `status` or `ls`.
+  - Worker fails to start (`start` surfaces error).
+
+## 9. Reuse of existing code
+- Copy or refactor the current `codex-task` communication layer (spawning `codex proto`, streaming events, UTF-8 line handling, shutdown procedure) into a reusable module consumed by each worker.
+- Reuse the transcript renderer to ensure output parity.
+
+## 10. Future enhancements (out of scope for initial version)
+- Optional metadata cache (`meta.json`) to avoid scanning directories on `ls`.
+- Structured JSON output for `status` / `ls`.
+- Built-in tailing (`codex-tasks logs <id>`).
+- Integration hooks for external orchestrators.
+
