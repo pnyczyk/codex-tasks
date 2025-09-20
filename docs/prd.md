@@ -14,6 +14,7 @@
 codex-tasks start [-t <title>] [prompt]
 codex-tasks send <task_id> <prompt>
 codex-tasks status <task_id>
+codex-tasks log [-f] [-n <lines>] <task_id>
 codex-tasks stop <task_id>
 codex-tasks ls [--state <STATE> ...]
 codex-tasks archive <task_id>
@@ -35,15 +36,21 @@ codex-tasks archive <task_id>
 - Determine status (`IDLE`, `RUNNING`, `STOPPED`, `ARCHIVED`, `DIED`).
 - Output JSON or table with status, title (if any), timestamps, and last result (if available).
 
-### 3.4 `stop`
+### 3.4 `log`
+- Stream the rendered transcript from `<task_id>.log`.
+- `-f/--follow` behaves like `tail -f`, continuing to stream new lines until interrupted.
+- `-n/--lines <N>` restricts the initial dump to the last *N* lines before optionally following.
+- Intended as the primary observability tool without attaching a TTY to the worker.
+
+### 3.5 `stop`
 - Notify the worker to send `shutdown` to Codex, wait for `ShutdownComplete`, and clean up (`.pid`, `.pipe`).
 - After graceful exit, status becomes `STOPPED`.
 
-### 3.5 `ls`
+### 3.6 `ls`
 - List all tasks in `~/.codex/tasks/` plus archived entries in `done/YYYY/MM/DD/`.
 - Optional `--state` filters (multiple allowed).
 
-### 3.6 `archive`
+### 3.7 `archive`
 - Move task files into `done/<YYYY>/<MM>/<DD>/<task_id>/`.
 - Status becomes `ARCHIVED`.
 
@@ -71,10 +78,10 @@ codex-tasks archive <task_id>
 1. **Spawn**: parent CLI forks a worker, writes initial files, and returns `task_id`.
 2. **Initialization**: worker launches `codex proto` with piped stdin/stdout, replicating existing `codex-task` logic.
 3. **Main loop**:
-   - Read user prompts from `<task_id>.pipe` (line/segment-based). Each prompt triggers `RUNNING` → `IDLE` transitions.
+   - Keep `<task_id>.pipe` open for reading; translate each UTF-8 segment into a prompt. The worker tolerates writers connecting and disconnecting repeatedly, only reacting to the explicit `/quit` sentinel.
    - Forward Codex events to the renderer, appending to `<task_id>.log` and updating `<task_id>.result` when appropriate.
 4. **Shutdown**:
-   - On `stop` or EOF on pipe, send `{"id":"sub-…","op":{"type":"shutdown"}}` (same as current implementation).
+   - `stop` writes `/quit` into the pipe. The worker interprets this sentinel, sends `{"id":"sub-…","op":{"type":"shutdown"}}`, and begins the shutdown sequence.
    - Wait for `ShutdownComplete`; close pipes; kill process on timeout (5 s) with logging.
 5. **Termination**: remove `.pid`/`.pipe`. If exit was graceful → `STOPPED`; if worker dies unexpectedly → `DIED`.
 
@@ -106,4 +113,3 @@ archive → ARCHIVED (files moved to done/…)
 - Structured JSON output for `status` / `ls`.
 - Built-in tailing (`codex-tasks logs <id>`).
 - Integration hooks for external orchestrators.
-
