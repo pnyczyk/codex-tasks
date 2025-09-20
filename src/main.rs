@@ -123,7 +123,7 @@ async fn run_event_loop(
     let mut shutdown_sent = false;
     let mut shutdown_acknowledged = false;
     let child_pid = child.id().unwrap_or_default();
-    let mut stdin_lines = BufReader::new(stdin_handle).lines();
+    let mut stdin_lines = BufReader::with_capacity(4096, stdin_handle).split(b'\n');
 
     'outer: loop {
         tokio::select! {
@@ -145,9 +145,17 @@ async fn run_event_loop(
                     }
                 }
             }
-            line = stdin_lines.next_line() => {
+            line = stdin_lines.next_segment() => {
                 match line {
-                    Ok(Some(line)) => {
+                    Ok(Some(line_bytes)) => {
+                        let line = match String::from_utf8(line_bytes) {
+                            Ok(line) => line,
+                            Err(err) => {
+                                eprintln!("Failed to decode stdin as UTF-8: {err:#}");
+                                continue;
+                            }
+                        };
+
                         let trimmed = line.trim();
                         if trimmed.is_empty() {
                             continue;
