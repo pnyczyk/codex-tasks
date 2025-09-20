@@ -124,6 +124,7 @@ async fn run_event_loop(
     let mut shutdown_acknowledged = false;
     let child_pid = child.id().unwrap_or_default();
     let mut stdin_lines = BufReader::with_capacity(4096, stdin_handle).split(b'\n');
+    let mut stdin_open = true;
 
     'outer: loop {
         tokio::select! {
@@ -145,7 +146,7 @@ async fn run_event_loop(
                     }
                 }
             }
-            line = stdin_lines.next_segment() => {
+            line = stdin_lines.next_segment(), if stdin_open => {
                 match line {
                     Ok(Some(line_bytes)) => {
                         let line = match String::from_utf8(line_bytes) {
@@ -167,7 +168,8 @@ async fn run_event_loop(
                                 &mut shutdown_sent,
                                 child_pid,
                             ).await?;
-                            break 'outer;
+                            stdin_open = false;
+                            continue;
                         }
 
                         process_user_line(
@@ -181,23 +183,23 @@ async fn run_event_loop(
                         ).await?;
                     }
                     Ok(None) => {
+                        stdin_open = false;
                         initiate_shutdown(
                             &mut writer,
                             &mut next_submission_id,
                             &mut shutdown_sent,
                             child_pid,
                         ).await?;
-                        break 'outer;
                     }
                     Err(err) => {
                         eprintln!("Failed to read stdin: {err:#}");
+                        stdin_open = false;
                         initiate_shutdown(
                             &mut writer,
                             &mut next_submission_id,
                             &mut shutdown_sent,
                             child_pid,
                         ).await?;
-                        break 'outer;
                     }
                 }
             }
