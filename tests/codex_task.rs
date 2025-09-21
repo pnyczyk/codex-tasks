@@ -3,11 +3,11 @@
 use std::env;
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Child, Stdio};
 use std::time::Duration;
 use tempfile::TempDir;
-use std::os::unix::fs::PermissionsExt;
 
 const STUB_SCRIPT: &str = r"#!/usr/bin/env python3
 import json
