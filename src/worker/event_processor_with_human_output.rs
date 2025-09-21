@@ -35,9 +35,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use crate::event_processor::CodexStatus;
-use crate::event_processor::EventProcessor;
-use crate::event_processor::handle_last_message;
+use crate::worker::event_processor::CodexStatus;
+use crate::worker::event_processor::EventProcessor;
+use crate::worker::event_processor::handle_last_message;
 use codex_common::create_config_summary_entries;
 
 /// This should be configurable. When used in CI, users may not want to impose

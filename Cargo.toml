@@ -1,11 +1,12 @@
 [package]
-name = "codex-task"
+name = "codex-tasks"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 anyhow = "1"
 chrono = "0.4.40"
+clap = { version = "4.5", features = ["derive"] }
 codex-common = { path = "third_party/codex/codex-rs/common", features = ["elapsed"] }
 codex-core = { path = "third_party/codex/codex-rs/core" }
 codex-protocol = { path = "third_party/codex/codex-rs/protocol" }
@@ -25,4 +26,4 @@ tokio = { version = "1", features = [
 
 [dev-dependencies]
 assert_cmd = "2"
-tempfile = "3"
+predicates = "3"
