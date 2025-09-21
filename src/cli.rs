@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Args, Parser, Subcommand};
 
 use crate::task::TaskState;
@@ -34,6 +36,9 @@ pub enum Command {
     Ls(LsArgs),
     /// Archive a completed task.
     Archive(ArchiveArgs),
+    /// Internal entry-point used to run a worker process.
+    #[command(hide = true)]
+    Worker(WorkerArgs),
 }
 
 /// Arguments for the `start` subcommand.
@@ -95,4 +100,21 @@ pub struct LsArgs {
 pub struct ArchiveArgs {
     /// Identifier of the task that should be archived.
     pub task_id: String,
+}
+
+/// Hidden arguments used when the CLI binary is re-executed as a worker.
+#[derive(Debug, Args)]
+pub struct WorkerArgs {
+    /// Identifier associated with the task managed by this worker.
+    #[arg(long = "task-id")]
+    pub task_id: String,
+    /// Filesystem root containing task artifacts.
+    #[arg(long = "store-root")]
+    pub store_root: PathBuf,
+    /// Optional task title (primarily used for diagnostics).
+    #[arg(long)]
+    pub title: Option<String>,
+    /// Optional prompt to send once the worker is fully initialized.
+    #[arg(long)]
+    pub prompt: Option<String>,
 }

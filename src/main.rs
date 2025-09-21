@@ -3,11 +3,12 @@ pub mod storage;
 pub mod task;
 pub mod worker;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 
 use crate::cli::{
     ArchiveArgs, Cli, Command, LogArgs, LsArgs, SendArgs, StartArgs, StatusArgs, StopArgs,
+    WorkerArgs,
 };
 
 fn main() -> Result<()> {
@@ -24,6 +25,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Stop(args) => handle_stop(args),
         Command::Ls(args) => handle_ls(args),
         Command::Archive(args) => handle_archive(args),
+        Command::Worker(args) => handle_worker(args),
     }
 }
 
@@ -53,6 +55,20 @@ fn handle_ls(_args: LsArgs) -> Result<()> {
 
 fn handle_archive(_args: ArchiveArgs) -> Result<()> {
     not_implemented("archive")
+}
+
+fn handle_worker(args: WorkerArgs) -> Result<()> {
+    let config = crate::worker::child::WorkerConfig::new(
+        args.task_id,
+        args.store_root,
+        args.title,
+        args.prompt,
+    )?;
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to initialize async runtime for worker")?
+        .block_on(crate::worker::child::run_worker(config))
 }
 
 fn not_implemented(command: &str) -> Result<()> {
