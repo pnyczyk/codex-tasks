@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use codex_core::config::{Config, ConfigOverrides};
 use codex_core::protocol::{Event, InputItem, Op, Submission};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
@@ -56,6 +56,7 @@ pub(crate) async fn run_interactive_session() -> Result<()> {
         &config,
         &mut event_rx,
         tokio::io::stdin(),
+        None,
     )
     .await
 }
@@ -107,14 +108,18 @@ pub(crate) struct ChildHandles {
 }
 
 #[allow(dead_code)]
-pub(crate) async fn run_event_loop(
+pub(crate) async fn run_event_loop<R>(
     mut child: Child,
     stdin: ChildStdin,
     event_processor: &mut EventProcessorWithHumanOutput,
     config: &Config,
     event_rx: &mut mpsc::UnboundedReceiver<Event>,
-    stdin_handle: tokio::io::Stdin,
-) -> Result<()> {
+    input: R,
+    initial_prompt: Option<String>,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
     let mut writer = Some(BufWriter::new(stdin));
     let mut next_submission_id: u64 = 1;
     let mut prompt: Option<String> = None;
@@ -122,8 +127,21 @@ pub(crate) async fn run_event_loop(
     let mut shutdown_sent = false;
     let mut shutdown_acknowledged = false;
     let child_pid = child.id().unwrap_or_default();
-    let mut stdin_lines = BufReader::with_capacity(4096, stdin_handle).split(b'\n');
-    let mut stdin_open = true;
+    let mut input_lines = BufReader::with_capacity(4096, input).split(b'\n');
+    let mut input_open = true;
+
+    if let Some(initial_line) = initial_prompt {
+        process_user_line(
+            initial_line,
+            &mut prompt,
+            &mut printed_summary,
+            event_processor,
+            config,
+            &mut writer,
+            &mut next_submission_id,
+        )
+        .await?;
+    }
 
     'outer: loop {
         tokio::select! {
@@ -145,13 +163,13 @@ pub(crate) async fn run_event_loop(
                     }
                 }
             }
-            line = stdin_lines.next_segment(), if stdin_open => {
+            line = input_lines.next_segment(), if input_open => {
                 match line {
                     Ok(Some(line_bytes)) => {
                         let line = match String::from_utf8(line_bytes) {
                             Ok(line) => line,
                             Err(err) => {
-                                eprintln!("Failed to decode stdin as UTF-8: {err:#}");
+                                eprintln!("Failed to decode prompt source as UTF-8: {err:#}");
                                 continue;
                             }
                         };
@@ -167,7 +185,7 @@ pub(crate) async fn run_event_loop(
                                 &mut shutdown_sent,
                                 child_pid,
                             ).await?;
-                            stdin_open = false;
+                            input_open = false;
                             continue;
                         }
 
@@ -182,7 +200,7 @@ pub(crate) async fn run_event_loop(
                         ).await?;
                     }
                     Ok(None) => {
-                        stdin_open = false;
+                        input_open = false;
                         initiate_shutdown(
                             &mut writer,
                             &mut next_submission_id,
@@ -191,8 +209,8 @@ pub(crate) async fn run_event_loop(
                         ).await?;
                     }
                     Err(err) => {
-                        eprintln!("Failed to read stdin: {err:#}");
-                        stdin_open = false;
+                        eprintln!("Failed to read prompt source: {err:#}");
+                        input_open = false;
                         initiate_shutdown(
                             &mut writer,
                             &mut next_submission_id,

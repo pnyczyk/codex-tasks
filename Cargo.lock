@@ -452,6 +452,7 @@ dependencies = [
  "codex-core",
  "codex-protocol",
  "dirs 5.0.1",
+ "libc",
  "owo-colors",
  "predicates",
  "serde",
