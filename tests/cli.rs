@@ -9,7 +9,8 @@ use std::thread;
 use std::time::Duration;
 
 use assert_cmd::Command;
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
+use predicates::prelude::PredicateBooleanExt;
 use serde::Deserialize;
 use serde_json::{from_str, json, Value};
 use tempfile::{tempdir, TempDir};
@@ -35,12 +36,136 @@ fn help_lists_supported_subcommands() {
 #[test]
 fn unfinished_subcommands_return_not_implemented_errors() {
     let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
-    cmd.args(["ls", "--state", "RUNNING"]);
+    cmd.args(["log", "task-xyz"]);
     cmd.assert()
         .failure()
-        .stderr(predicates::str::contains("`ls` is not implemented yet"));
+        .stderr(predicates::str::contains("`log` is not implemented yet"));
 }
 
+#[test]
+fn ls_lists_active_and_archived_tasks() {
+    let home = tempdir().expect("tempdir");
+    let task_root = home.path().join(".codex").join("tasks");
+    let archive_root = task_root.join("done");
+    fs::create_dir_all(&archive_root).expect("layout");
+
+    let active_id = "task-active";
+    let active_time = Utc
+        .with_ymd_and_hms(2024, 1, 1, 0, 0, 0)
+        .single()
+        .expect("timestamp");
+    let active_metadata = json!({
+        "id": active_id,
+        "title": "Active Task",
+        "state": "RUNNING",
+        "created_at": active_time.to_rfc3339(),
+        "updated_at": active_time.to_rfc3339(),
+    });
+    fs::write(
+        task_root.join(format!("{active_id}.json")),
+        serde_json::to_string_pretty(&active_metadata).expect("serialize"),
+    )
+    .expect("write active metadata");
+
+    let archived_id = "task-archived";
+    let archived_time = Utc
+        .with_ymd_and_hms(2023, 12, 31, 23, 59, 59)
+        .single()
+        .expect("timestamp");
+    let archived_dir = archive_root
+        .join("2023")
+        .join("12")
+        .join("31")
+        .join(archived_id);
+    fs::create_dir_all(&archived_dir).expect("archive dir");
+    let archived_metadata = json!({
+        "id": archived_id,
+        "title": "Archived Task",
+        "state": "ARCHIVED",
+        "created_at": archived_time.to_rfc3339(),
+        "updated_at": archived_time.to_rfc3339(),
+    });
+    fs::write(
+        archived_dir.join(format!("{archived_id}.json")),
+        serde_json::to_string_pretty(&archived_metadata).expect("serialize"),
+    )
+    .expect("write archive metadata");
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    cmd.env("HOME", home.path()).arg("ls");
+    cmd.assert()
+        .success()
+        .stdout(predicates::str::contains("ID"))
+        .stdout(predicates::str::contains("task-active"))
+        .stdout(predicates::str::contains("task-archived"))
+        .stdout(predicates::str::contains("ACTIVE"))
+        .stdout(predicates::str::contains("ARCHIVE"))
+        .stdout(predicates::str::contains("RUNNING"))
+        .stdout(predicates::str::contains("ARCHIVED"));
+}
+
+#[test]
+fn ls_supports_state_filtering() {
+    let home = tempdir().expect("tempdir");
+    let task_root = home.path().join(".codex").join("tasks");
+    let archive_root = task_root.join("done");
+    fs::create_dir_all(&archive_root).expect("layout");
+
+    let running_id = "task-running";
+    let running_time = Utc
+        .with_ymd_and_hms(2024, 2, 2, 2, 2, 2)
+        .single()
+        .expect("timestamp");
+    let running_metadata = json!({
+        "id": running_id,
+        "title": "Running Task",
+        "state": "RUNNING",
+        "created_at": running_time.to_rfc3339(),
+        "updated_at": running_time.to_rfc3339(),
+    });
+    fs::write(
+        task_root.join(format!("{running_id}.json")),
+        serde_json::to_string_pretty(&running_metadata).expect("serialize"),
+    )
+    .expect("write running metadata");
+
+    let archived_id = "task-archived";
+    let archived_time = Utc
+        .with_ymd_and_hms(2024, 2, 1, 1, 1, 1)
+        .single()
+        .expect("timestamp");
+    let archived_dir = archive_root
+        .join("2024")
+        .join("02")
+        .join("01")
+        .join(archived_id);
+    fs::create_dir_all(&archived_dir).expect("archive dir");
+    let archived_metadata = json!({
+        "id": archived_id,
+        "title": "Archived Task",
+        "state": "ARCHIVED",
+        "created_at": archived_time.to_rfc3339(),
+        "updated_at": archived_time.to_rfc3339(),
+    });
+    fs::write(
+        archived_dir.join(format!("{archived_id}.json")),
+        serde_json::to_string_pretty(&archived_metadata).expect("serialize"),
+    )
+    .expect("write archive metadata");
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    cmd.env("HOME", home.path())
+        .args(["ls", "--state", "RUNNING"]);
+    cmd.assert()
+        .success()
+        .stdout(predicates::str::contains("task-running"))
+        .stdout(predicates::str::contains("RUNNING"))
+        .stdout(predicates::str::contains("ACTIVE"))
+        .stdout(predicates::str::contains("ID"))
+        .stdout(predicates::str::contains("ARCHIVE").not())
+        .stdout(predicates::str::contains("task-archived").not());
+}
+
+#[test]
 fn start_command_creates_task_and_launches_worker() {
     let tmp = tempdir().expect("tempdir");
 
