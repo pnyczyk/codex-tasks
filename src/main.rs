@@ -5,9 +5,10 @@ pub mod task;
 pub mod worker;
 
 use std::collections::VecDeque;
-use std::ffi::OsStr;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, ErrorKind, Write};
+use anyhow::{Context, Result, bail, ensure};
+use chrono::Utc;
+use crate::storage::{METADATA_FILE_NAME, TaskPaths, TaskStore};
+use crate::worker::launcher::{WorkerLaunchRequest, spawn_worker};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -56,9 +57,15 @@ fn handle_start(args: StartArgs) -> Result<()> {
     let task_id = store.generate_task_id();
     let task_paths = store.task(task_id.clone());
 
-    let mut metadata = TaskMetadata::new(task_id.clone(), title.clone(), TaskState::Running);
-    metadata.initial_prompt = prompt.clone();
-
+            let not_found = err
+                .is_some_and(|io_err| io_err.kind() == ErrorKind::NotFound);
+            if not_found {
+                if let Some((_, archived_metadata)) = store.find_archived_task(&task_id)? {
+                    bail!(
+                        "task {} is ARCHIVED and cannot receive prompts",
+                        archived_metadata.id
+                    );
+                }
     store
         .save_metadata(&metadata)
         .with_context(|| format!("failed to persist metadata for task {task_id}"))?;
@@ -235,8 +242,72 @@ fn handle_stop(args: StopArgs) -> Result<()> {
     Ok(())
 }
 
-fn handle_ls(args: LsArgs) -> Result<()> {
+fn handle_archive(args: ArchiveArgs) -> Result<()> {
     let store = TaskStore::default()?;
+    store.ensure_layout()?;
+
+    if let Some((_, metadata)) = store.find_archived_task(&args.task_id)? {
+        println!("Task {} is already archived.", metadata.id);
+        return Ok(());
+    }
+
+    let paths = store.task(args.task_id.clone());
+    let mut metadata = match paths.read_metadata() {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            let not_found = err
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io_err| io_err.kind() == ErrorKind::NotFound);
+            if not_found {
+                bail!("task {} was not found", args.task_id);
+            }
+            return Err(err);
+        }
+    };
+
+    if metadata.state == TaskState::Running {
+        bail!("task {} is RUNNING; stop it before archiving", metadata.id);
+    }
+
+    if let Some(pid) = paths.read_pid()? {
+        if is_process_running(pid)? {
+            bail!("task {} is RUNNING; stop it before archiving", metadata.id);
+        }
+    }
+
+    paths.remove_pid()?;
+    paths.remove_pipe()?;
+
+    let now = Utc::now();
+    metadata.state = TaskState::Archived;
+    metadata.updated_at = now;
+    paths.write_metadata(&metadata)?;
+
+    let bucket = store.ensure_archive_bucket(now)?;
+    let destination = bucket.join(&metadata.id);
+    if destination.exists() {
+        bail!(
+            "archive destination {} already exists for task {}",
+            destination.display(),
+            metadata.id
+        );
+    }
+
+    fs::rename(paths.directory(), &destination).with_context(|| {
+        format!(
+            "failed to move task {} into archive at {}",
+            metadata.id,
+            destination.display()
+        )
+    })?;
+
+    println!(
+        "Task {} archived to {}.",
+        metadata.id,
+        destination.display()
+    );
+
+    Ok(())
     store.ensure_layout()?;
 
     let mut tasks = Vec::new();
@@ -390,33 +461,37 @@ fn cleanup_task_files(paths: &TaskPaths) -> Result<()> {
     Ok(())
 }
 
-fn is_process_running(pid: i32) -> Result<bool> {
-    if pid <= 0 {
-        return Ok(false);
+        if !file_type.is_dir() {
+
+        let metadata_path = path.join(METADATA_FILE_NAME);
+        if !metadata_path.exists() {
+
+        let metadata = read_metadata_file(&metadata_path)?;
     }
 
-    let result = unsafe { libc::kill(pid, 0) };
-    if result == 0 {
-        return Ok(true);
-    }
+    let mut queue = VecDeque::from([archive_root]);
+    while let Some(dir) = queue.pop_front() {
+        let metadata_path = dir.join(METADATA_FILE_NAME);
+        if metadata_path.exists() {
+            let metadata = read_metadata_file(&metadata_path)?;
+            tasks.push(ListedTask {
+                metadata,
+                archived: true,
+            });
+            continue;
+        }
 
-    let err = std::io::Error::last_os_error();
-    match err.raw_os_error() {
-        Some(code) if code == libc::ESRCH => Ok(false),
-        Some(code) if code == libc::EPERM => Ok(true),
-        _ => Err(err).with_context(|| format!("failed to query status of process {pid}")),
-    }
-}
+            if entry.file_type()?.is_dir() {
+                queue.push_back(entry.path());
 
-struct ListedTask {
-    metadata: TaskMetadata,
-    archived: bool,
-}
-
-fn collect_active_tasks(store: &TaskStore) -> Result<Vec<ListedTask>> {
-    let mut tasks = Vec::new();
-    let root = store.root().to_path_buf();
-    if !root.exists() {
+    if let Some(parent) = path
+        .parent()
+        .and_then(|value| value.file_name())
+        .and_then(|value| value.to_str())
+    {
+            metadata.id == parent,
+            "metadata id {} does not match directory {}",
+            parent
         return Ok(tasks);
     }
 

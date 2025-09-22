@@ -49,7 +49,12 @@ pub fn spawn_worker(request: WorkerLaunchRequest) -> Result<Child> {
     command.arg("--task-id");
     command.arg(task_paths.id());
     command.arg("--store-root");
-    command.arg(task_paths.directory());
+    let store_root = task_paths
+        .directory()
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| task_paths.directory().to_path_buf());
+    command.arg(store_root);
 
     if let Some(title) = title {
         command.env(TITLE_ENV_VAR, title);
