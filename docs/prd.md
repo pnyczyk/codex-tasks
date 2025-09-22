@@ -47,8 +47,9 @@ codex-tasks archive <task_id>
 - After graceful exit, status becomes `STOPPED`.
 
 ### 3.6 `ls`
-- List all tasks in `~/.codex/tasks/` plus archived entries in `archive/YYYY/MM/DD/`.
-- Optional `--state` filters (multiple allowed).
+- List active tasks in `~/.codex/tasks/`.
+- Use `-a/--all` to include archived entries from `archive/YYYY/MM/DD/`.
+- Optional `--state` filters (multiple allowed via repeated flags or comma-delimited values).
 
 ### 3.7 `archive`
 - Move task files into `archive/<YYYY>/<MM>/<DD>/<task_id>/`.

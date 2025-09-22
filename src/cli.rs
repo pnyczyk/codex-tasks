@@ -94,8 +94,11 @@ pub struct StopArgs {
 #[derive(Debug, Args)]
 pub struct LsArgs {
     /// Restrict results to tasks that match the provided states.
-    #[arg(long = "state", value_enum)]
+    #[arg(long = "state", value_enum, value_delimiter = ',', num_args = 0..)]
     pub states: Vec<TaskState>,
+    /// Include archived tasks in the listing.
+    #[arg(short = 'a', long = "all")]
+    pub include_archived: bool,
 }
 
 /// Arguments for the `archive` subcommand.

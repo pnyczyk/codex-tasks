@@ -254,9 +254,12 @@ fn handle_ls(args: LsArgs) -> Result<()> {
     let store = TaskStore::default()?;
     store.ensure_layout()?;
 
+    let include_archived = args.include_archived;
     let mut tasks = Vec::new();
     tasks.extend(collect_active_tasks(&store)?);
-    tasks.extend(collect_archived_tasks(&store)?);
+    if include_archived {
+        tasks.extend(collect_archived_tasks(&store)?);
+    }
 
     let states = args.states;
     if !states.is_empty() {
