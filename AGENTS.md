@@ -8,6 +8,7 @@
    - When the user provides a new request, first search existing GitHub issues to see if the scope already overlaps.
      - If an overlapping issue exists, stop and propose re-scoping or reusing that ticket instead of duplicating effort.
    - If no existing issue covers the request, create a fresh GitHub issue describing the task.
+   - The above does not apply to non-coding tasks like reviews, questions regarding code, etc.
 
 3. **Branching strategy**
    - Create a feature branch using the pattern `feat/<issue-number>-<short-name>`.
