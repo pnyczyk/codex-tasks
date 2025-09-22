@@ -73,6 +73,19 @@ impl TaskMetadata {
             initial_prompt: None,
         }
     }
+
+    /// Updates the `updated_at` timestamp to the current moment.
+    pub fn touch(&mut self) {
+        self.updated_at = Utc::now();
+    }
+
+    /// Sets the task state and refreshes the `updated_at` timestamp.
+    pub fn set_state(&mut self, state: TaskState) {
+        if self.state != state {
+            self.state = state;
+        }
+        self.touch();
+    }
 }
 
 mod serde_datetime {

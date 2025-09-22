@@ -9,13 +9,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use codex_core::config::{Config, ConfigOverrides};
-use codex_core::protocol::Event;
+use codex_core::protocol::{Event, EventMsg};
 use tokio::fs::OpenOptions as TokioOpenOptions;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 
 use crate::storage::{TaskPaths, TaskStore};
-use crate::task::TaskId;
+use crate::task::{TaskId, TaskState};
+use crate::worker::event_processor::{CodexStatus, EventProcessor};
 use crate::worker::event_processor_with_human_output::EventProcessorWithHumanOutput;
 use crate::worker::runner;
 
@@ -100,11 +101,12 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
     let codex_config = Config::load_with_cli_overrides(Vec::new(), ConfigOverrides::default())
         .context("failed to load Codex configuration")?;
 
-    let mut event_processor = EventProcessorWithHumanOutput::create_with_ansi(
+    let event_processor = EventProcessorWithHumanOutput::create_with_ansi(
         false,
         &codex_config,
         Some(paths.result_path()),
     );
+    let mut event_processor = MetadataAwareProcessor::new(event_processor, paths.clone());
 
     let runner::ChildHandles {
         child,
@@ -164,6 +166,10 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
 
     drop(log_file);
 
+    if let Err(err) = paths.update_metadata(|metadata| metadata.set_state(TaskState::Stopped)) {
+        log_metadata_error(paths.id(), "mark STOPPED after worker exit", err);
+    }
+
     result
 }
 
@@ -195,6 +201,81 @@ fn create_pipe(path: &Path) -> Result<()> {
     Ok(())
 }
 
+struct MetadataAwareProcessor<P> {
+    inner: P,
+    task_paths: TaskPaths,
+}
+
+impl<P> MetadataAwareProcessor<P> {
+    fn new(inner: P, task_paths: TaskPaths) -> Self {
+        Self { inner, task_paths }
+    }
+
+    fn update_state(&self, state: TaskState) {
+        if let Err(err) = self
+            .task_paths
+            .update_metadata(|metadata| metadata.set_state(state.clone()))
+        {
+            log_metadata_error(
+                self.task_paths.id(),
+                &format!("update state to {state}"),
+                err,
+            );
+        }
+    }
+
+    fn mark_idle(&self) {
+        let last_result = match self.task_paths.read_last_result() {
+            Ok(contents) => contents,
+            Err(err) => {
+                log_metadata_error(
+                    self.task_paths.id(),
+                    "read last result while marking IDLE",
+                    err,
+                );
+                None
+            }
+        };
+
+        if let Err(err) = self.task_paths.update_metadata(|metadata| {
+            metadata.set_state(TaskState::Idle);
+            metadata.last_result = last_result.clone();
+        }) {
+            log_metadata_error(self.task_paths.id(), "mark IDLE after completion", err);
+        }
+    }
+}
+
+impl<P> EventProcessor for MetadataAwareProcessor<P>
+where
+    P: EventProcessor,
+{
+    fn print_config_summary(&mut self, config: &Config, prompt: &str) {
+        self.inner.print_config_summary(config, prompt);
+    }
+
+    fn process_event(&mut self, event: Event) -> CodexStatus {
+        let message = event.msg.clone();
+        let status = self.inner.process_event(event);
+        match message {
+            EventMsg::TaskStarted(_) => self.update_state(TaskState::Running),
+            EventMsg::TaskComplete(_) => self.mark_idle(),
+            EventMsg::ShutdownComplete => self.update_state(TaskState::Stopped),
+            _ => {}
+        }
+        status
+    }
+}
+
+fn log_metadata_error(task_id: &str, context: &str, err: anyhow::Error) {
+    let not_found = err
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound);
+    if !not_found {
+        eprintln!("failed to {context} for task {task_id}: {err:#}");
+    }
+}
+
 fn redirect_stdio_to(log: &std::fs::File) -> Result<()> {
     let fd = log.as_raw_fd();
     unsafe {
@@ -218,6 +299,8 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::storage::TaskStore;
+    use crate::task::{TaskMetadata, TaskState};
+    use codex_core::protocol::{TaskCompleteEvent, TaskStartedEvent};
     use tempfile::tempdir;
 
     static ENV_GUARD: Mutex<()> = Mutex::new(());
@@ -229,6 +312,87 @@ mod tests {
 
     fn remove_env(key: &str) {
         unsafe { env::remove_var(key) };
+    }
+
+    struct DummyProcessor;
+
+    impl EventProcessor for DummyProcessor {
+        fn print_config_summary(&mut self, _config: &Config, _prompt: &str) {}
+
+        fn process_event(&mut self, _event: Event) -> CodexStatus {
+            CodexStatus::Running
+        }
+    }
+
+    #[test]
+    fn metadata_aware_processor_marks_running_on_task_started() {
+        let tmp = tempdir().expect("tempdir");
+        let store = TaskStore::new(tmp.path().join("store"));
+        store.ensure_layout().expect("layout");
+        let paths = store.task("task-running".to_string());
+        paths.ensure_directory().expect("directory");
+        let metadata = TaskMetadata::new("task-running".into(), None, TaskState::Idle);
+        paths.write_metadata(&metadata).expect("write metadata");
+
+        let mut processor = MetadataAwareProcessor::new(DummyProcessor, paths.clone());
+        let event = Event {
+            id: "1".into(),
+            msg: EventMsg::TaskStarted(TaskStartedEvent {
+                model_context_window: None,
+            }),
+        };
+        processor.process_event(event);
+
+        let metadata = paths.read_metadata().expect("read metadata");
+        assert_eq!(metadata.state, TaskState::Running);
+    }
+
+    #[test]
+    fn metadata_aware_processor_marks_idle_and_updates_result() {
+        let tmp = tempdir().expect("tempdir");
+        let store = TaskStore::new(tmp.path().join("store"));
+        store.ensure_layout().expect("layout");
+        let paths = store.task("task-complete".to_string());
+        paths.ensure_directory().expect("directory");
+        let metadata = TaskMetadata::new("task-complete".into(), None, TaskState::Running);
+        paths.write_metadata(&metadata).expect("write metadata");
+        paths
+            .write_last_result("final result")
+            .expect("write result");
+
+        let mut processor = MetadataAwareProcessor::new(DummyProcessor, paths.clone());
+        let event = Event {
+            id: "2".into(),
+            msg: EventMsg::TaskComplete(TaskCompleteEvent {
+                last_agent_message: Some("done".into()),
+            }),
+        };
+        processor.process_event(event);
+
+        let metadata = paths.read_metadata().expect("read metadata");
+        assert_eq!(metadata.state, TaskState::Idle);
+        assert_eq!(metadata.last_result.as_deref(), Some("final result"));
+    }
+
+    #[test]
+    fn metadata_aware_processor_marks_stopped_on_shutdown() {
+        let tmp = tempdir().expect("tempdir");
+        let store = TaskStore::new(tmp.path().join("store"));
+        store.ensure_layout().expect("layout");
+        let paths = store.task("task-stop".to_string());
+        paths.ensure_directory().expect("directory");
+        let metadata = TaskMetadata::new("task-stop".into(), None, TaskState::Running);
+        paths.write_metadata(&metadata).expect("write metadata");
+
+        let mut processor = MetadataAwareProcessor::new(DummyProcessor, paths.clone());
+        let event = Event {
+            id: "3".into(),
+            msg: EventMsg::ShutdownComplete,
+        };
+        processor.process_event(event);
+
+        let metadata = paths.read_metadata().expect("read metadata");
+        assert_eq!(metadata.state, TaskState::Stopped);
     }
 
     #[test]
