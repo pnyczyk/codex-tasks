@@ -51,8 +51,8 @@
    - **Depends on:** Tasks 2 & 4
 
 9. **Implement `ls` command**
-   - Enumerate `tasks/` and `tasks/archive/**` directories.
-   - Aggregate metadata for each task; support `--state` filters.
+   - Enumerate active tasks under `tasks/`; include `tasks/archive/**` when `-a/--all` is provided.
+   - Aggregate metadata for each task; support `--state` filters and multiple values.
    - **Depends on:** Task 2
 
 10. **Implement `log` command**

@@ -16,6 +16,9 @@ pub(crate) trait EventProcessor {
 
     /// Handle a single event emitted by the agent.
     fn process_event(&mut self, event: Event) -> CodexStatus;
+
+    /// Emit a log entry describing the user's prompt.
+    fn print_user_prompt(&mut self, _prompt: &str) {}
 }
 
 pub(crate) fn handle_last_message(last_agent_message: Option<&str>, output_file: &Path) {

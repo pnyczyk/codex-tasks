@@ -47,8 +47,9 @@ codex-tasks archive <task_id>
 - After graceful exit, status becomes `STOPPED`.
 
 ### 3.6 `ls`
-- List all tasks in `~/.codex/tasks/` plus archived entries in `archive/YYYY/MM/DD/`.
-- Optional `--state` filters (multiple allowed).
+- List active tasks in `~/.codex/tasks/`.
+- Use `-a/--all` to include archived entries from `archive/YYYY/MM/DD/`.
+- Optional `--state` filters (multiple allowed via repeated flags or comma-delimited values).
 
 ### 3.7 `archive`
 - Move task files into `archive/<YYYY>/<MM>/<DD>/<task_id>/`.
@@ -60,6 +61,7 @@ codex-tasks archive <task_id>
 - `state`: one of {`IDLE`, `RUNNING`, `STOPPED`, `ARCHIVED`, `DIED`}.
 - `created_at`, `updated_at` timestamps (recorded by worker).
 - `last_result`: UTF-8 text of the most recent Codex answer (available in `IDLE`, `STOPPED`, `ARCHIVED`).
+- `last_prompt`: UTF-8 text of the most recent user prompt (updated on `start` and each `send`).
 
 ## 5. Filesystem layout (`~/.codex/tasks/`)
 - Active tasks live under `~/.codex/tasks/<task_id>/`, keeping related files grouped together.

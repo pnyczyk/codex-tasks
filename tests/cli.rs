@@ -97,7 +97,7 @@ fn ls_lists_active_and_archived_tasks() {
     )
     .expect("write archive metadata");
     let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
-    cmd.env("HOME", home.path()).arg("ls");
+    cmd.env("HOME", home.path()).args(["ls", "--all"]);
     cmd.assert()
         .success()
         .stdout(predicates::str::contains("ID"))
@@ -107,6 +107,48 @@ fn ls_lists_active_and_archived_tasks() {
         .stdout(predicates::str::contains("ARCHIVE"))
         .stdout(predicates::str::contains("RUNNING"))
         .stdout(predicates::str::contains("ARCHIVED"));
+}
+
+#[test]
+fn ls_excludes_archived_by_default() {
+    let home = tempdir().expect("tempdir");
+    let task_root = home.path().join(".codex").join("tasks");
+    let archive_root = task_root.join("archive");
+    fs::create_dir_all(&archive_root).expect("layout");
+
+    let active_id = "task-active";
+    write_metadata(&task_root, active_id, "IDLE");
+
+    let archived_id = "task-archived";
+    let archived_dir = archive_root
+        .join("2024")
+        .join("03")
+        .join("04")
+        .join(archived_id);
+    fs::create_dir_all(&archived_dir).expect("archive dir");
+    let timestamp = Utc
+        .with_ymd_and_hms(2024, 3, 4, 5, 6, 7)
+        .single()
+        .expect("timestamp");
+    let archived_metadata = json!({
+        "id": archived_id,
+        "state": "ARCHIVED",
+        "created_at": timestamp.to_rfc3339(),
+        "updated_at": timestamp.to_rfc3339(),
+    });
+    fs::write(
+        archived_dir.join("task.json"),
+        serde_json::to_string_pretty(&archived_metadata).expect("serialize"),
+    )
+    .expect("write archive metadata");
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    cmd.env("HOME", home.path()).arg("ls");
+    cmd.assert()
+        .success()
+        .stdout(predicates::str::contains(active_id))
+        .stdout(predicates::str::contains(archived_id).not())
+        .stdout(predicates::str::contains("ARCHIVE").not());
 }
 
 #[test]
@@ -164,7 +206,7 @@ fn ls_supports_state_filtering() {
 
     let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
     cmd.env("HOME", home.path())
-        .args(["ls", "--state", "RUNNING"]);
+        .args(["ls", "--all", "--state", "RUNNING"]);
     cmd.assert()
         .success()
         .stdout(predicates::str::contains("task-running"))
@@ -173,6 +215,54 @@ fn ls_supports_state_filtering() {
         .stdout(predicates::str::contains("ID"))
         .stdout(predicates::str::contains("ARCHIVE").not())
         .stdout(predicates::str::contains("task-archived").not());
+}
+
+#[test]
+fn ls_accepts_multiple_states() {
+    let home = tempdir().expect("tempdir");
+    let task_root = home.path().join(".codex").join("tasks");
+    let archive_root = task_root.join("archive");
+    fs::create_dir_all(&archive_root).expect("layout");
+
+    write_metadata(&task_root, "task-idle", "IDLE");
+    write_metadata(&task_root, "task-running", "RUNNING");
+    let pid = i32::try_from(std::process::id()).expect("pid fits");
+    fs::write(
+        task_root.join("task-running").join("task.pid"),
+        pid.to_string(),
+    )
+    .expect("write pid");
+
+    let archived_dir = archive_root
+        .join("2024")
+        .join("05")
+        .join("06")
+        .join("task-archived");
+    fs::create_dir_all(&archived_dir).expect("archive dir");
+    let timestamp = Utc
+        .with_ymd_and_hms(2024, 5, 6, 7, 8, 9)
+        .single()
+        .expect("timestamp");
+    let metadata = json!({
+        "id": "task-archived",
+        "state": "ARCHIVED",
+        "created_at": timestamp.to_rfc3339(),
+        "updated_at": timestamp.to_rfc3339(),
+    });
+    fs::write(
+        archived_dir.join("task.json"),
+        serde_json::to_string_pretty(&metadata).expect("serialize"),
+    )
+    .expect("write archive metadata");
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    cmd.env("HOME", home.path())
+        .args(["ls", "--all", "--state", "RUNNING,ARCHIVED"]);
+    cmd.assert()
+        .success()
+        .stdout(predicates::str::contains("task-running"))
+        .stdout(predicates::str::contains("task-archived"))
+        .stdout(predicates::str::contains("task-idle").not());
 }
 
 #[test]
@@ -626,6 +716,7 @@ fn status_reports_idle_task_in_json() {
     assert_eq!(value["state"], "IDLE");
     assert_eq!(value["location"], "active");
     assert_eq!(value["pid"], Value::Null);
+    assert_eq!(value["last_prompt"], Value::Null);
 }
 
 #[test]
@@ -656,6 +747,7 @@ fn status_flags_missing_pid_as_died() {
     assert_eq!(value["state"], "DIED");
     assert_eq!(value["location"], "active");
     assert_eq!(value["pid"], Value::Null);
+    assert_eq!(value["last_prompt"], Value::Null);
 }
 
 #[test]
@@ -693,6 +785,7 @@ fn status_reports_running_task_when_pid_alive() {
     assert_eq!(value["state"], "RUNNING");
     assert_eq!(value["pid"], pid);
     assert_eq!(value["location"], "active");
+    assert_eq!(value["last_prompt"], Value::Null);
 
     let _ = child.kill();
     let _ = child.wait();
@@ -733,6 +826,7 @@ fn status_detects_archived_tasks() {
     assert_eq!(value["location"], "archived");
     assert_eq!(value["pid"], Value::Null);
     assert_eq!(value["last_result"], "final outcome");
+    assert_eq!(value["last_prompt"], Value::Null);
 }
 
 #[test]
