@@ -1,4 +1,5 @@
 mod cli;
+mod status;
 pub mod storage;
 pub mod task;
 pub mod worker;
@@ -16,6 +17,7 @@ use crate::cli::{
     ArchiveArgs, Cli, Command, LogArgs, LsArgs, SendArgs, StartArgs, StatusArgs, StopArgs,
     WorkerArgs,
 };
+use crate::status::{StatusCommandOptions, StatusFormat};
 use crate::storage::TaskStore;
 use crate::task::{TaskMetadata, TaskState};
 use crate::worker::launcher::{spawn_worker, WorkerLaunchRequest};
@@ -182,8 +184,16 @@ fn set_blocking(file: &File) -> io::Result<()> {
     Ok(())
 }
 
-fn handle_status(_args: StatusArgs) -> Result<()> {
-    not_implemented("status")
+fn handle_status(args: StatusArgs) -> Result<()> {
+    let format = if args.json {
+        StatusFormat::Json
+    } else {
+        StatusFormat::Human
+    };
+    status::run(StatusCommandOptions {
+        task_id: args.task_id,
+        format,
+    })
 }
 
 fn handle_log(_args: LogArgs) -> Result<()> {

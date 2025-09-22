@@ -1,3 +1,5 @@
+use std::fmt;
+
 use chrono::{DateTime, Utc};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
@@ -19,6 +21,25 @@ pub enum TaskState {
     Archived,
     #[value(name = "DIED")]
     Died,
+}
+
+impl TaskState {
+    /// Returns the canonical uppercase representation for this state.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TaskState::Idle => "IDLE",
+            TaskState::Running => "RUNNING",
+            TaskState::Stopped => "STOPPED",
+            TaskState::Archived => "ARCHIVED",
+            TaskState::Died => "DIED",
+        }
+    }
+}
+
+impl fmt::Display for TaskState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Core metadata tracked for each task on disk.
