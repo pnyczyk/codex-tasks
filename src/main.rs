@@ -4,14 +4,16 @@ pub mod storage;
 pub mod task;
 pub mod worker;
 
-use std::fs::{File, OpenOptions};
+use std::ffi::OsStr;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use clap::Parser;
 use libc::{ENXIO, O_NONBLOCK};
 
@@ -218,8 +220,42 @@ fn handle_stop(args: StopArgs) -> Result<()> {
     Ok(())
 }
 
-fn handle_ls(_args: LsArgs) -> Result<()> {
-    not_implemented("ls")
+fn handle_ls(args: LsArgs) -> Result<()> {
+    let store = TaskStore::default()?;
+    store.ensure_layout()?;
+
+    let mut tasks = Vec::new();
+    tasks.extend(collect_active_tasks(&store)?);
+    tasks.extend(collect_archived_tasks(&store)?);
+
+    let states = args.states;
+    if !states.is_empty() {
+        tasks.retain(|task| states.contains(&task.metadata.state));
+    }
+
+    tasks.sort_by(|a, b| b.metadata.updated_at.cmp(&a.metadata.updated_at));
+
+    if tasks.is_empty() {
+        println!("No tasks found.");
+        return Ok(());
+    }
+
+    println!(
+        "{:<36}  {:<20}  {:<10}  {:<25}  {:<25}  {}",
+        "ID", "Title", "State", "Created At", "Updated At", "Location"
+    );
+    for entry in tasks {
+        let title = entry.metadata.title.as_deref().unwrap_or("-");
+        let created = entry.metadata.created_at.to_rfc3339();
+        let updated = entry.metadata.updated_at.to_rfc3339();
+        let location = if entry.archived { "ARCHIVE" } else { "ACTIVE" };
+        println!(
+            "{:<36}  {:<20}  {:<10}  {:<25}  {:<25}  {}",
+            entry.metadata.id, title, entry.metadata.state, created, updated, location
+        );
+    }
+
+    Ok(())
 }
 
 fn handle_archive(_args: ArchiveArgs) -> Result<()> {
@@ -355,6 +391,96 @@ fn is_process_running(pid: i32) -> Result<bool> {
         Some(code) if code == libc::EPERM => Ok(true),
         _ => Err(err).with_context(|| format!("failed to query status of process {pid}")),
     }
+}
+
+struct ListedTask {
+    metadata: TaskMetadata,
+    archived: bool,
+}
+
+fn collect_active_tasks(store: &TaskStore) -> Result<Vec<ListedTask>> {
+    let mut tasks = Vec::new();
+    let root = store.root().to_path_buf();
+    if !root.exists() {
+        return Ok(tasks);
+    }
+
+    for entry in fs::read_dir(&root)
+        .with_context(|| format!("failed to read task directory {}", root.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to read entry in {}", root.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to inspect {}", path.display()))?;
+        if file_type.is_dir() {
+            continue;
+        }
+        if path.extension() != Some(OsStr::new("json")) {
+            continue;
+        }
+        let metadata = read_metadata_file(&path)?;
+        tasks.push(ListedTask {
+            metadata,
+            archived: false,
+        });
+    }
+
+    Ok(tasks)
+}
+
+fn collect_archived_tasks(store: &TaskStore) -> Result<Vec<ListedTask>> {
+    let mut tasks = Vec::new();
+    let archive_root = store.archive_root();
+    if !archive_root.exists() {
+        return Ok(tasks);
+    }
+
+    let mut stack = vec![archive_root];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir)
+            .with_context(|| format!("failed to read archive directory {}", dir.display()))?
+        {
+            let entry = entry
+                .with_context(|| format!("failed to read archive entry in {}", dir.display()))?;
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("failed to inspect {}", path.display()))?;
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension() != Some(OsStr::new("json")) {
+                continue;
+            }
+            let metadata = read_metadata_file(&path)?;
+            tasks.push(ListedTask {
+                metadata,
+                archived: true,
+            });
+        }
+    }
+
+    Ok(tasks)
+}
+
+fn read_metadata_file(path: &Path) -> Result<TaskMetadata> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read metadata file {}", path.display()))?;
+    let metadata: TaskMetadata = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse metadata file {}", path.display()))?;
+
+    if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
+        ensure!(
+            metadata.id == stem,
+            "metadata id {} does not match filename {}",
+            metadata.id,
+            stem
+        );
+    }
+
+    Ok(metadata)
 }
 
 #[cfg(test)]
