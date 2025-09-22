@@ -321,12 +321,15 @@ pub(crate) async fn process_user_line<P: EventProcessor>(
     writer: &mut Option<BufWriter<ChildStdin>>,
     next_submission_id: &mut u64,
 ) -> Result<()> {
-    if prompt.is_none() {
+    let first_prompt = prompt.is_none();
+    if first_prompt {
         *prompt = Some(text.clone());
         if !*printed_summary {
             event_processor.print_config_summary(config, &text);
             *printed_summary = true;
         }
+    } else {
+        event_processor.print_user_prompt(&text);
     }
 
     if let Some(writer) = writer.as_mut() {

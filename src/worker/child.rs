@@ -254,6 +254,16 @@ where
         self.inner.print_config_summary(config, prompt);
     }
 
+    fn print_user_prompt(&mut self, prompt: &str) {
+        if let Err(err) = self.task_paths.update_metadata(|metadata| {
+            metadata.last_prompt = Some(prompt.to_string());
+            metadata.touch();
+        }) {
+            log_metadata_error(self.task_paths.id(), "record last prompt", err);
+        }
+        self.inner.print_user_prompt(prompt);
+    }
+
     fn process_event(&mut self, event: Event) -> CodexStatus {
         let message = event.msg.clone();
         let status = self.inner.process_event(event);
@@ -393,6 +403,23 @@ mod tests {
 
         let metadata = paths.read_metadata().expect("read metadata");
         assert_eq!(metadata.state, TaskState::Stopped);
+    }
+
+    #[test]
+    fn metadata_aware_processor_records_last_prompt() {
+        let tmp = tempdir().expect("tempdir");
+        let store = TaskStore::new(tmp.path().join("store"));
+        store.ensure_layout().expect("layout");
+        let paths = store.task("task-log".to_string());
+        paths.ensure_directory().expect("directory");
+        let metadata = TaskMetadata::new("task-log".into(), None, TaskState::Idle);
+        paths.write_metadata(&metadata).expect("write metadata");
+
+        let mut processor = MetadataAwareProcessor::new(DummyProcessor, paths.clone());
+        processor.print_user_prompt("Follow-up prompt");
+
+        let metadata = paths.read_metadata().expect("read metadata");
+        assert_eq!(metadata.last_prompt.as_deref(), Some("Follow-up prompt"));
     }
 
     #[test]

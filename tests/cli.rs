@@ -716,6 +716,7 @@ fn status_reports_idle_task_in_json() {
     assert_eq!(value["state"], "IDLE");
     assert_eq!(value["location"], "active");
     assert_eq!(value["pid"], Value::Null);
+    assert_eq!(value["last_prompt"], Value::Null);
 }
 
 #[test]
@@ -746,6 +747,7 @@ fn status_flags_missing_pid_as_died() {
     assert_eq!(value["state"], "DIED");
     assert_eq!(value["location"], "active");
     assert_eq!(value["pid"], Value::Null);
+    assert_eq!(value["last_prompt"], Value::Null);
 }
 
 #[test]
@@ -783,6 +785,7 @@ fn status_reports_running_task_when_pid_alive() {
     assert_eq!(value["state"], "RUNNING");
     assert_eq!(value["pid"], pid);
     assert_eq!(value["location"], "active");
+    assert_eq!(value["last_prompt"], Value::Null);
 
     let _ = child.kill();
     let _ = child.wait();
@@ -823,6 +826,7 @@ fn status_detects_archived_tasks() {
     assert_eq!(value["location"], "archived");
     assert_eq!(value["pid"], Value::Null);
     assert_eq!(value["last_result"], "final outcome");
+    assert_eq!(value["last_prompt"], Value::Null);
 }
 
 #[test]

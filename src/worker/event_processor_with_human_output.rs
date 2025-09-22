@@ -168,12 +168,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
         // Echo the prompt that will be sent to the agent so it is visible in the
         // transcript/logs before any events come in. Note the prompt may have been
         // read from stdin, so it may not be visible in the terminal otherwise.
-        ts_println!(
-            self,
-            "{}\n{}",
-            "User instructions:".style(self.bold).style(self.cyan),
-            prompt
-        );
+        self.print_user_prompt(prompt);
     }
 
     fn process_event(&mut self, event: Event) -> CodexStatus {
@@ -582,6 +577,15 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             EventMsg::ExitedReviewMode(_) => {}
         }
         CodexStatus::Running
+    }
+
+    fn print_user_prompt(&mut self, prompt: &str) {
+        ts_println!(
+            self,
+            "{}\n{}",
+            "User instructions:".style(self.bold).style(self.cyan),
+            prompt
+        );
     }
 }
 

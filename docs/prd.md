@@ -61,6 +61,7 @@ codex-tasks archive <task_id>
 - `state`: one of {`IDLE`, `RUNNING`, `STOPPED`, `ARCHIVED`, `DIED`}.
 - `created_at`, `updated_at` timestamps (recorded by worker).
 - `last_result`: UTF-8 text of the most recent Codex answer (available in `IDLE`, `STOPPED`, `ARCHIVED`).
+- `last_prompt`: UTF-8 text of the most recent user prompt (updated on `start` and each `send`).
 
 ## 5. Filesystem layout (`~/.codex/tasks/`)
 - Active tasks live under `~/.codex/tasks/<task_id>/`, keeping related files grouped together.

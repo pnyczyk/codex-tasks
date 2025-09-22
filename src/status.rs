@@ -78,6 +78,17 @@ fn render_human(record: &TaskStatusRecord) {
     if let Some(pid) = record.pid {
         println!("PID: {}", pid);
     }
+    match &record.metadata.last_prompt {
+        Some(prompt) => {
+            println!("Last Prompt:");
+            if prompt.trim().is_empty() {
+                println!("<empty>");
+            } else {
+                println!("{}", prompt);
+            }
+        }
+        None => println!("Last Prompt: <none>"),
+    }
     println!("Last Result:");
     match &record.metadata.last_result {
         Some(result) if !result.trim().is_empty() => println!("{}", result),
@@ -92,6 +103,7 @@ fn render_json(record: &TaskStatusRecord) -> Result<()> {
         "state": record.metadata.state.clone(),
         "created_at": record.metadata.created_at.clone(),
         "updated_at": record.metadata.updated_at.clone(),
+        "last_prompt": record.metadata.last_prompt.clone(),
         "last_result": record.metadata.last_result.clone(),
         "location": record.location.kind(),
         "directory": record.location.directory().display().to_string(),

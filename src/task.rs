@@ -57,6 +57,8 @@ pub struct TaskMetadata {
     pub last_result: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_prompt: Option<String>,
 }
 
 impl TaskMetadata {
@@ -71,6 +73,7 @@ impl TaskMetadata {
             updated_at: now,
             last_result: None,
             initial_prompt: None,
+            last_prompt: None,
         }
     }
 

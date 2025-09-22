@@ -63,6 +63,7 @@ fn handle_start(args: StartArgs) -> Result<()> {
     };
     let mut metadata = TaskMetadata::new(task_id.clone(), title.clone(), initial_state);
     metadata.initial_prompt = prompt.clone();
+    metadata.last_prompt = prompt.clone();
 
     store
         .save_metadata(&metadata)
@@ -119,10 +120,10 @@ fn handle_send(args: SendArgs) -> Result<()> {
     }
 
     let paths = store.task(task_id.clone());
-
-    if metadata.state != TaskState::Running {
-        metadata = paths.update_metadata(|record| record.set_state(TaskState::Running))?;
-    }
+    metadata = paths.update_metadata(|record| {
+        record.last_prompt = Some(prompt.clone());
+        record.set_state(TaskState::Running);
+    })?;
     let pipe_path = paths.pipe_path();
     let mut pipe = match OpenOptions::new()
         .write(true)
