@@ -26,16 +26,16 @@ This document describes the internal message-exchange protocol used by the Codex
 | Enum                | JSON value   | Meaning                                  |
 |---------------------|--------------|------------------------------------------|
 | `ReasoningEffort`   | `minimal`    | Minimal number of reasoning steps        |
-|                     | `low`        | Low intensity                             |
-|                     | `medium`     | Default (the `default` value)             |
-|                     | `high`       | Highest reasoning effort                  |
-| `ReasoningSummary`  | `auto`       | Automatic choice                          |
-|                     | `concise`    | Concise synthesis                          |
-|                     | `detailed`   | Detailed synthesis                         |
-|                     | `none`       | No reasoning summaries                     |
-| `Verbosity`         | `low`        | Shortest responses                         |
-|                     | `medium`     | Default length                             |
-|                     | `high`       | Most verbose responses                     |
+|                     | `low`        | Low intensity                            |
+|                     | `medium`     | Default (the enum's `default` value)     |
+|                     | `high`       | Highest reasoning effort                 |
+| `ReasoningSummary`  | `auto`       | Automatic choice                         |
+|                     | `concise`    | Concise summary                          |
+|                     | `detailed`   | Detailed summary                         |
+|                     | `none`       | No reasoning summary                     |
+| `Verbosity`         | `low`        | Shortest responses                       |
+|                     | `medium`     | Default length                           |
+|                     | `high`       | Most verbose responses                   |
 | `SandboxMode`       | `read-only`  | Read-only access                           |
 |                     | `workspace-write` | Global read, write limited to the workspace |
 |                     | `danger-full-access` | Full access to disk and network         |
