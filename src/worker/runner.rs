@@ -108,10 +108,10 @@ pub(crate) struct ChildHandles {
 }
 
 #[allow(dead_code)]
-pub(crate) async fn run_event_loop<R>(
+pub(crate) async fn run_event_loop<R, P>(
     mut child: Child,
     stdin: ChildStdin,
-    event_processor: &mut EventProcessorWithHumanOutput,
+    event_processor: &mut P,
     config: &Config,
     event_rx: &mut mpsc::UnboundedReceiver<Event>,
     input: R,
@@ -119,6 +119,7 @@ pub(crate) async fn run_event_loop<R>(
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
+    P: EventProcessor,
 {
     let mut writer = Some(BufWriter::new(stdin));
     let mut next_submission_id: u64 = 1;
@@ -265,8 +266,8 @@ where
 }
 
 #[allow(dead_code)]
-pub(crate) async fn handle_event(
-    event_processor: &mut EventProcessorWithHumanOutput,
+pub(crate) async fn handle_event<P: EventProcessor>(
+    event_processor: &mut P,
     event: Event,
     writer: &mut Option<BufWriter<ChildStdin>>,
     shutdown_acknowledged: &mut bool,
@@ -311,11 +312,11 @@ pub(crate) async fn initiate_shutdown(
 }
 
 #[allow(dead_code)]
-pub(crate) async fn process_user_line(
+pub(crate) async fn process_user_line<P: EventProcessor>(
     text: String,
     prompt: &mut Option<String>,
     printed_summary: &mut bool,
-    event_processor: &mut EventProcessorWithHumanOutput,
+    event_processor: &mut P,
     config: &Config,
     writer: &mut Option<BufWriter<ChildStdin>>,
     next_submission_id: &mut u64,

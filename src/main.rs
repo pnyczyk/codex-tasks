@@ -22,7 +22,7 @@ use crate::cli::{
     ArchiveArgs, Cli, Command, LogArgs, LsArgs, SendArgs, StartArgs, StatusArgs, StopArgs,
     WorkerArgs,
 };
-use crate::status::{StatusCommandOptions, StatusFormat};
+use crate::status::{StatusCommandOptions, StatusFormat, derive_active_state};
 use crate::storage::{LOG_FILE_NAME, METADATA_FILE_NAME, TaskPaths, TaskStore};
 use crate::task::{TaskMetadata, TaskState};
 use crate::worker::launcher::{WorkerLaunchRequest, spawn_worker};
@@ -56,7 +56,12 @@ fn handle_start(args: StartArgs) -> Result<()> {
     let task_id = store.generate_task_id();
     let task_paths = store.task(task_id.clone());
 
-    let mut metadata = TaskMetadata::new(task_id.clone(), title.clone(), TaskState::Running);
+    let initial_state = if prompt.is_some() {
+        TaskState::Running
+    } else {
+        TaskState::Idle
+    };
+    let mut metadata = TaskMetadata::new(task_id.clone(), title.clone(), initial_state);
     metadata.initial_prompt = prompt.clone();
 
     store
@@ -78,7 +83,7 @@ fn handle_send(args: SendArgs) -> Result<()> {
     let task_id = args.task_id;
     let prompt = args.prompt;
 
-    let metadata = match store.load_metadata(task_id.clone()) {
+    let mut metadata = match store.load_metadata(task_id.clone()) {
         Ok(metadata) => metadata,
         Err(err) => {
             let not_found = err
@@ -114,6 +119,10 @@ fn handle_send(args: SendArgs) -> Result<()> {
     }
 
     let paths = store.task(task_id.clone());
+
+    if metadata.state != TaskState::Running {
+        metadata = paths.update_metadata(|record| record.set_state(TaskState::Running))?;
+    }
     let pipe_path = paths.pipe_path();
     let mut pipe = match OpenOptions::new()
         .write(true)
@@ -302,11 +311,18 @@ fn handle_archive(args: ArchiveArgs) -> Result<()> {
         }
     };
 
-    if metadata.state == TaskState::Running {
+    let pid = paths.read_pid()?;
+    let derived_state = derive_active_state(&metadata.state, pid);
+    if derived_state == TaskState::Running {
         bail!("task {} is RUNNING; stop it before archiving", metadata.id);
     }
 
-    if let Some(pid) = paths.read_pid()? {
+    if metadata.state != derived_state {
+        metadata.set_state(derived_state.clone());
+        paths.write_metadata(&metadata)?;
+    }
+
+    if let Some(pid) = pid {
         if is_process_running(pid)? {
             bail!("task {} is RUNNING; stop it before archiving", metadata.id);
         }
@@ -401,6 +417,8 @@ fn stop_task(paths: &TaskPaths) -> Result<StopOutcome> {
     wait_for_worker_shutdown(paths, pid)?;
     cleanup_task_files(paths)?;
 
+    mark_task_state(paths, TaskState::Stopped)?;
+
     Ok(StopOutcome::Stopped)
 }
 
@@ -461,6 +479,18 @@ fn cleanup_task_files(paths: &TaskPaths) -> Result<()> {
     Ok(())
 }
 
+fn mark_task_state(paths: &TaskPaths, state: TaskState) -> Result<()> {
+    match paths.update_metadata(|metadata| metadata.set_state(state)) {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            let not_found = err
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io_err| io_err.kind() == ErrorKind::NotFound);
+            if not_found { Ok(()) } else { Err(err) }
+        }
+    }
+}
+
 fn is_process_running(pid: i32) -> Result<bool> {
     if pid <= 0 {
         return Ok(false);
@@ -508,7 +538,13 @@ fn collect_active_tasks(store: &TaskStore) -> Result<Vec<ListedTask>> {
             continue;
         }
 
-        let metadata = read_metadata_file(&metadata_path)?;
+        let mut metadata = read_metadata_file(&metadata_path)?;
+        let task_paths = store.task(metadata.id.clone());
+        let pid = task_paths.read_pid()?;
+        metadata.state = derive_active_state(&metadata.state, pid);
+        if metadata.last_result.is_none() {
+            metadata.last_result = task_paths.read_last_result()?;
+        }
         tasks.push(ListedTask {
             metadata,
             archived: false,

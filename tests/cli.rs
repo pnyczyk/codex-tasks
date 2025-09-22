@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::convert::TryFrom;
 use std::ffi::CString;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -69,6 +70,8 @@ fn ls_lists_active_and_archived_tasks() {
         serde_json::to_string_pretty(&active_metadata).expect("serialize"),
     )
     .expect("write active metadata");
+    let pid = i32::try_from(std::process::id()).expect("pid fits in i32");
+    fs::write(active_dir.join("task.pid"), pid.to_string()).expect("write pid");
 
     let archived_id = "task-archived";
     let archived_time = Utc
@@ -132,6 +135,8 @@ fn ls_supports_state_filtering() {
         serde_json::to_string_pretty(&running_metadata).expect("serialize"),
     )
     .expect("write running metadata");
+    let pid = i32::try_from(std::process::id()).expect("pid fits in i32");
+    fs::write(running_dir.join("task.pid"), pid.to_string()).expect("write pid");
 
     let archived_id = "task-archived";
     let archived_time = Utc
@@ -168,6 +173,26 @@ fn ls_supports_state_filtering() {
         .stdout(predicates::str::contains("ID"))
         .stdout(predicates::str::contains("ARCHIVE").not())
         .stdout(predicates::str::contains("task-archived").not());
+}
+
+#[test]
+fn ls_reports_idle_with_live_worker() {
+    let home = tempdir().expect("tempdir");
+    let task_root = home.path().join(".codex").join("tasks");
+    fs::create_dir_all(&task_root).expect("layout");
+
+    let task_id = "task-idle";
+    write_metadata(&task_root, task_id, "IDLE");
+    let pid = i32::try_from(std::process::id()).expect("pid fits in i32");
+    fs::write(task_root.join(task_id).join("task.pid"), pid.to_string()).expect("write pid");
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    cmd.env("HOME", home.path()).args(["ls", "--state", "IDLE"]);
+    cmd.assert()
+        .success()
+        .stdout(predicates::str::contains("task-idle"))
+        .stdout(predicates::str::contains("IDLE"))
+        .stdout(predicates::str::contains("RUNNING").not());
 }
 
 #[test]
@@ -220,6 +245,27 @@ fn start_command_creates_task_and_launches_worker() {
     assert!(pid_path.exists(), "worker should record its pid");
     let pid_contents = fs::read_to_string(pid_path).expect("pid readable");
     assert!(!pid_contents.trim().is_empty(), "pid should not be empty");
+}
+
+#[test]
+fn start_without_prompt_sets_idle_state() {
+    let tmp = tempdir().expect("tempdir");
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    cmd.arg("start")
+        .env("HOME", tmp.path())
+        .env("CODEX_TASKS_EXIT_AFTER_START", "1");
+    let assert = cmd.assert().success();
+    let output = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    let task_id = output.trim();
+    assert!(!task_id.is_empty(), "start should print the task id");
+
+    let store_root = tmp.path().join(".codex").join("tasks");
+    let metadata_path = store_root.join(task_id).join("task.json");
+    let metadata: Value =
+        serde_json::from_str(&fs::read_to_string(&metadata_path).expect("read metadata"))
+            .expect("parse metadata");
+    assert_eq!(metadata["state"], "IDLE");
 }
 
 #[test]
@@ -335,6 +381,12 @@ fn send_writes_prompt_to_pipe() {
     let line = rx.recv().expect("prompt from pipe");
     reader.join().expect("reader thread");
     assert_eq!(line, "hello world\n");
+
+    let metadata_path = tasks_dir.join(task_id).join("task.json");
+    let metadata: Value =
+        serde_json::from_str(&fs::read_to_string(&metadata_path).expect("read metadata"))
+            .expect("parse metadata");
+    assert_eq!(metadata["state"], "RUNNING");
 }
 
 #[test]
@@ -477,6 +529,8 @@ fn archive_rejects_running_task() {
         serde_json::to_string_pretty(&metadata).expect("serialize"),
     )
     .expect("write metadata");
+    let pid = i32::try_from(std::process::id()).expect("pid fits");
+    fs::write(task_dir.join("task.pid"), pid.to_string()).expect("write pid");
 
     let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
     cmd.env("HOME", home)
@@ -684,11 +738,7 @@ fn status_detects_archived_tasks() {
 #[test]
 fn log_displays_entire_file() {
     let home = tempdir().expect("tempdir");
-    let task_dir = home
-        .path()
-        .join(".codex")
-        .join("tasks")
-        .join("task-123");
+    let task_dir = home.path().join(".codex").join("tasks").join("task-123");
     fs::create_dir_all(&task_dir).expect("create dirs");
     let log_path = task_dir.join("task.log");
     fs::write(&log_path, b"line one\nline two\n").expect("write log");
@@ -702,11 +752,7 @@ fn log_displays_entire_file() {
 #[test]
 fn log_honors_tail_flag() {
     let home = tempdir().expect("tempdir");
-    let task_dir = home
-        .path()
-        .join(".codex")
-        .join("tasks")
-        .join("task-abc");
+    let task_dir = home.path().join(".codex").join("tasks").join("task-abc");
     fs::create_dir_all(&task_dir).expect("create dirs");
     let log_path = task_dir.join("task.log");
     fs::write(&log_path, b"keep\nlast\nline\n").expect("write log");

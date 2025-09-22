@@ -243,6 +243,17 @@ impl TaskPaths {
         Ok(())
     }
 
+    /// Loads metadata, applies a mutation, persists it, and returns the updated record.
+    pub fn update_metadata<F>(&self, mutate: F) -> Result<TaskMetadata>
+    where
+        F: FnOnce(&mut TaskMetadata),
+    {
+        let mut metadata = self.read_metadata()?;
+        mutate(&mut metadata);
+        self.write_metadata(&metadata)?;
+        Ok(metadata)
+    }
+
     /// Loads structured metadata for the task from disk.
     pub fn read_metadata(&self) -> Result<TaskMetadata> {
         let path = self.metadata_path();
