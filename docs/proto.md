@@ -1,54 +1,54 @@
-# Specyfikacja protokołu Codex
+# Codex Protocol Specification
 
-## Cel dokumentu
-Niniejszy dokument opisuje wewnętrzny protokół wymiany komunikatów używany przez Codex CLI/TUI i serwer (`codex-core`). Zawiera kompletne definicje struktur JSON oraz przepływów potrzebnych do implementacji klienta, który łączy się z Codexem, wysyła polecenia i odbiera zdarzenia. Spec obejmuje zarówno kolejki `Submission`/`Event`, jak i interfejs JSON-RPC wykorzystywany przez warstwę MCP.
+## Purpose of this document
+This document describes the internal message-exchange protocol used by the Codex CLI/TUI and the server (`codex-core`). It contains complete definitions of the JSON structures and flows required to implement a client that connects to Codex, sends commands, and receives events. The spec covers both the `Submission`/`Event` queues and the JSON-RPC interface consumed by the MCP layer.
 
-## Kanały komunikacyjne i serializacja
-- Komunikacja między klientem a agentem zachodzi dwukierunkowo i asynchronicznie.
-  - **Submission Queue (SQ)**: klient publikuje żądania w postaci obiektów `Submission`.
-  - **Event Queue (EQ)**: agent (Codex) publikuje odpowiedzi i powiadomienia jako obiekty `Event`.
-- Wszystkie struktury są serializowane do JSON przy użyciu `serde`. Enumy wykorzystują pola dyskryminujące `type` (albo `method`/`mode`) z wartościami w `snake_case` lub `camelCase`, zgodnie z atrybutami w kodzie.
-- Część typów generuje definicje TypeScript (`ts-rs`). Dlatego pola i warianty muszą zachować stabilne nazwy.
+## Communication channels and serialization
+- Communication between the client and the agent is bidirectional and asynchronous.
+  - **Submission Queue (SQ):** the client publishes requests as `Submission` objects.
+  - **Event Queue (EQ):** the agent (Codex) publishes responses and notifications as `Event` objects.
+- All structures are serialized to JSON using `serde`. Enums use discriminator fields (`type`, or `method`/`mode`) whose values are in `snake_case` or `camelCase`, as dictated by the attributes in the code.
+- Some types emit TypeScript definitions (`ts-rs`), therefore field and variant names must remain stable.
 
-### Identyfikatory i korelacja
-- Każdy `Submission` ma unikalny (w obrębie sesji) `id: String`. Wartość jest zwracana w odpowiadających zdarzeniach `Event.id`.
-- `Event.id` pozwala sparować sekwencję komunikatów z konkretnym żądaniem. Dodatkowe zdarzenia tła mogą również korzystać z ostatniego `id` lub własnych identyfikatorów ustalonych przez serwer.
-- MCP korzysta z `RequestId` (liczby całkowite lub string) zgodnie z JSON-RPC 2.0.
+### Identifiers and correlation
+- Every `Submission` has an `id: String` that is unique within the session. The value is echoed by corresponding events via `Event.id`.
+- `Event.id` allows the client to pair the sequence of messages with a specific request. Additional background events can also reuse the most recent `id` or provide their own server-assigned identifiers.
+- MCP uses `RequestId` (integer or string) per JSON-RPC 2.0.
 
-### Konwencje serializacji
-- `Duration` (np. w `ExecCommandEndEvent.duration`) serializuje się jako obiekt `{ "secs": u64, "nanos": u32 }`, zgodnie z domyślną implementacją `serde` dla `std::time::Duration`.
-- `PathBuf` serializuje się jako ciąg znaków (ścieżka absolutna lub względna względem serwera).
-- `Option<T>` pomijane są w JSON, chyba że wartość to `Some(None)` – wówczas serializowane jest `null` (przykład: `OverrideTurnContext.effort: null` czyści ustawienie).
-- Bufory bajtów (`Vec<u8>`) w strumieniach (np. `ExecCommandOutputDeltaEvent.chunk`) są kodowane w base64 (`serde_with::base64`).
+### Serialization conventions
+- `Duration` (for example in `ExecCommandEndEvent.duration`) serializes as `{ "secs": u64, "nanos": u32 }`, the default `serde` representation for `std::time::Duration`.
+- `PathBuf` serializes as a string (absolute path or one relative to the server).
+- `Option<T>` fields are omitted from JSON unless the value is `Some(None)`—in that case `null` is emitted (e.g. `OverrideTurnContext.effort: null` clears the setting).
+- Byte buffers (`Vec<u8>`) in streaming payloads (e.g. `ExecCommandOutputDeltaEvent.chunk`) are Base64 encoded (`serde_with::base64`).
 
-## Typy bazowe i enumy współdzielone
-### Reasoning i verbosity (`config_types.rs`)
-| Enum                | Wartość JSON  | Znaczenie                                 |
-|---------------------|---------------|-------------------------------------------|
-| `ReasoningEffort`   | `minimal`     | Minimalna liczba kroków reasoning         |
-|                     | `low`         | Niska intensywność                        |
-|                     | `medium`      | Domyślna (wartość `default`)              |
-|                     | `high`        | Najwyższe wysiłki reasoning               |
-| `ReasoningSummary`  | `auto`        | Automatyczny dobór                        |
-|                     | `concise`     | Krótka synteza                            |
-|                     | `detailed`    | Szczegółowa synteza                       |
-|                     | `none`        | Brak podsumowań reasoning                 |
-| `Verbosity`         | `low`         | Najkrótsze odpowiedzi                     |
-|                     | `medium`      | Domyślna długość                          |
-|                     | `high`        | Maksymalnie rozbudowane odpowiedzi        |
-| `SandboxMode`       | `read-only`   | Dostęp tylko do odczytu                   |
-|                     | `workspace-write` | Odczyt globalny, zapis w workspace    |
-|                     | `danger-full-access` | Pełny dostęp do dysku i sieci      |
+## Shared base types and enums
+### Reasoning and verbosity (`config_types.rs`)
+| Enum                | JSON value   | Meaning                                  |
+|---------------------|--------------|------------------------------------------|
+| `ReasoningEffort`   | `minimal`    | Minimal number of reasoning steps        |
+|                     | `low`        | Low intensity                             |
+|                     | `medium`     | Default (the `default` value)             |
+|                     | `high`       | Highest reasoning effort                  |
+| `ReasoningSummary`  | `auto`       | Automatic choice                          |
+|                     | `concise`    | Concise synthesis                          |
+|                     | `detailed`   | Detailed synthesis                         |
+|                     | `none`       | No reasoning summaries                     |
+| `Verbosity`         | `low`        | Shortest responses                         |
+|                     | `medium`     | Default length                             |
+|                     | `high`       | Most verbose responses                     |
+| `SandboxMode`       | `read-only`  | Read-only access                           |
+|                     | `workspace-write` | Global read, write limited to the workspace |
+|                     | `danger-full-access` | Full access to disk and network         |
 
-### Polityka zgód (`AskForApproval`)
-Serde `rename_all = "kebab-case"`; wartości tekstowe:
-- `untrusted` (UnlessTrusted) – automatycznie zatwierdzane tylko bezpieczne komendy odczytu.
-- `on-failure` – wszystko autozatwierdzane w sandboxie; w razie błędu wymagane ręczne zatwierdzenie poza sandboxem.
-- `on-request` – decyzję o proszeniu o zgodę pozostawia się modelowi (domyślna).
-- `never` – nigdy nie prosić użytkownika; błędy są zwracane do modelu.
+### Approval policy (`AskForApproval`)
+`serde(rename_all = "kebab-case")`; textual values:
+- `untrusted` (UnlessTrusted) – only safe read commands are auto-approved.
+- `on-failure` – all commands auto-approve inside the sandbox; failures require explicit approval outside the sandbox.
+- `on-request` – leaves the decision of requesting approval to the model (default).
+- `never` – never ask the user; errors are returned to the model.
 
-### Polityka sandboxa (`SandboxPolicy`)
-Serializacja z polem `mode`:
+### Sandbox policy (`SandboxPolicy`)
+Serialized with a `mode` field:
 ```json
 {"mode": "danger-full-access"}
 ```
@@ -64,30 +64,30 @@ Serializacja z polem `mode`:
   "exclude_slash_tmp": false
 }
 ```
-- Pole `writable_roots` rozszerza listę katalogów zapisu (poza `cwd`, `/tmp`, `$TMPDIR`).
-- `network_access` = `true` dopuszcza ruch sieciowy wewnątrz sandboxa.
-- `exclude_tmpdir_env_var` / `exclude_slash_tmp` pozwalają usunąć katalogi tymczasowe z listy domyślnej.
-- `WritableRoot { root, read_only_subpaths }` służy do kontroli zapisu (np. `.git`).
+- `writable_roots` extends the list of writable directories (in addition to `cwd`, `/tmp`, `$TMPDIR`).
+- `network_access = true` permits network traffic inside the sandbox.
+- `exclude_tmpdir_env_var` / `exclude_slash_tmp` let you remove the default temporary directories.
+- `WritableRoot { root, read_only_subpaths }` controls write access (e.g. `.git`).
 
-### Elementy wejściowe (`InputItem`)
+### Input items (`InputItem`)
 `#[serde(tag = "type", rename_all = "snake_case")]`:
 - `{"type":"text", "text":"..."}`
 - `{"type":"image", "image_url":"data:image/png;base64,..."}`
-- `{"type":"local_image", "path":"/absolute/path.png"}` – serwer konwertuje plik na wariant `image`.
+- `{"type":"local_image", "path":"/absolute/path.png"}` – the server converts the file to the `image` variant.
 
 ## Submission Queue
-### Format przesyłki
+### Submission format
 ```json
 {
   "id": "unique-turn-id",
-  "op": { ... }  // jedna z operacji Op
+  "op": { ... }  // one of the Op operations
 }
 ```
-Pole `op` zawiera jedną z operacji poniżej. Nazwy `type` są w `snake_case`.
+The `op` field contains exactly one of the operations below. The `type` values are in `snake_case`.
 
-### Operacje `Op`
+### `Op` operations
 #### `interrupt`
-Brak dodatkowych pól. Sygnał przerwania bieżącej tury; spodziewaj się `EventMsg::TurnAborted`.
+No additional fields. Signals interruption of the current turn; expect `EventMsg::TurnAborted`.
 
 #### `user_input`
 ```json
@@ -96,10 +96,10 @@ Brak dodatkowych pól. Sygnał przerwania bieżącej tury; spodziewaj się `Even
   "items": [InputItem, ...]
 }
 ```
-Wysyła pojedynczą wiadomość użytkownika bez zmiany kontekstu tury.
+Sends a single user message without altering the turn context.
 
 #### `user_turn`
-Pełna tura rozmowy z kontekstem wykonawczym:
+A full conversation turn with execution context:
 ```json
 {
   "type": "user_turn",
@@ -108,22 +108,22 @@ Pełna tura rozmowy z kontekstem wykonawczym:
   "approval_policy": "on-request",
   "sandbox_policy": {"mode": "workspace-write", "network_access": false},
   "model": "o4-mini",
-  "effort": "medium",           // opcjonalne, gdy model wspiera reasoning
-  "summary": "auto"              // wymagane, enum ReasoningSummary
+  "effort": "medium",           // optional, when the model supports reasoning
+  "summary": "auto"              // required, ReasoningSummary enum
 }
 ```
 
 #### `override_turn_context`
-Aktualizuje domyślne parametry kolejnych tur:
+Updates the default context for upcoming turns:
 ```json
 {
   "type": "override_turn_context",
-  "cwd": "/nowa/sciezka",                  // opcjonalne
-  "approval_policy": "never",              // opcjonalne
+  "cwd": "/new/path",                    // optional
+  "approval_policy": "never",            // optional
   "sandbox_policy": { ... },
   "model": "o4-mini",
-  "effort": null,                           // null usuwa ustawienie reasoning effort
-  "summary": "concise"                      // opcjonalne
+  "effort": null,                         // null clears the reasoning effort
+  "summary": "concise"                    // optional
 }
 ```
 
@@ -135,14 +135,14 @@ Aktualizuje domyślne parametry kolejnych tur:
   "decision": "approved" | "approved_for_session" | "denied" | "abort"
 }
 ```
-`ReviewDecision` opisuje reakcję użytkownika na prośbę `ExecApprovalRequest`.
+`ReviewDecision` captures the user’s response to an `ExecApprovalRequest`.
 
 #### `patch_approval`
-Analogiczne do powyższego, ale dla `ApplyPatchApprovalRequest`.
+Analogous to the above, but for `ApplyPatchApprovalRequest`.
 
 #### `add_to_history`
 ```json
-{"type":"add_to_history", "text":"Notatka"}
+{"type":"add_to_history", "text":"Note"}
 ```
 
 #### `get_history_entry_request`
@@ -153,37 +153,37 @@ Analogiczne do powyższego, ale dla `ApplyPatchApprovalRequest`.
   "log_id": 123456
 }
 ```
-Prosi o pojedynczy wpis historii globalnej.
+Requests a single global history entry.
 
 #### `get_path`
-Zwraca ścieżkę do pliku rollout bieżącej sesji (`EventMsg::ConversationPath`).
+Returns the path to the rollout file for the current session (`EventMsg::ConversationPath`).
 
 #### `list_mcp_tools`
-Żąda listy narzędzi MCP dostępnych w sesji (`EventMsg::McpListToolsResponse`).
+Requests the list of MCP tools available in the session (`EventMsg::McpListToolsResponse`).
 
 #### `list_custom_prompts`
-Żąda katalogu promptów (`EventMsg::ListCustomPromptsResponse`).
+Requests the custom prompt catalog (`EventMsg::ListCustomPromptsResponse`).
 
 #### `compact`
-Prośba o streszczenie kontekstu konwersacji przez model.
+Asks the model to summarize the conversation context.
 
 #### `review`
 ```json
 {
   "type": "review",
   "review_request": {
-    "prompt": "Przeanalizuj zmiany...",
-    "user_facing_hint": "Skup się na wydajności"
+    "prompt": "Review the changes...",
+    "user_facing_hint": "Focus on performance"
   }
 }
 ```
-Uruchamia podrzędną sesję code review.
+Starts a subordinate code-review session.
 
 #### `shutdown`
-Sygnał zamknięcia instancji Codexa. Odpowiedź: `EventMsg::ShutdownComplete`.
+Signals that the Codex instance should exit. Response: `EventMsg::ShutdownComplete`.
 
 ## Event Queue
-### Format zdarzenia
+### Event format
 ```json
 {
   "id": "submission-id",
@@ -194,20 +194,20 @@ Sygnał zamknięcia instancji Codexa. Odpowiedź: `EventMsg::ShutdownComplete`.
 }
 ```
 
-### Typy `EventMsg`
-Poniższa lista zawiera wszystkie warianty (wartość pola `type` → payload):
+### `EventMsg` variants
+The list below contains every variant (`type` value → payload):
 
-**Obsługa błędów i statusu**
+**Error and status handling**
 - `error` → `{ "message": String }`
 - `task_started` → `{ "model_context_window": u64? }`
 - `task_complete` → `{ "last_agent_message": String? }`
 - `token_count` → `{ "info": TokenUsageInfo? }`
 - `turn_aborted` → `{ "reason": "interrupted" | "replaced" | "review_ended" }`
-- `shutdown_complete` → brak pól (pusty obiekt)
+- `shutdown_complete` → empty object
 - `stream_error` → `{ "message": String }`
 - `background_event` → `{ "message": String }`
 
-**Wiadomości tekstowe i reasoning**
+**Text messages and reasoning**
 - `agent_message` → `{ "message": String }`
 - `agent_message_delta` → `{ "delta": String }`
 - `user_message` → `{ "message": String, "kind"?: "plain"|"user_instructions"|"environment_context", "images"?: [String] }`
@@ -215,15 +215,15 @@ Poniższa lista zawiera wszystkie warianty (wartość pola `type` → payload):
 - `agent_reasoning_delta` → `{ "delta": String }`
 - `agent_reasoning_raw_content` → `{ "text": String }`
 - `agent_reasoning_raw_content_delta` → `{ "delta": String }`
-- `agent_reasoning_section_break` → `{}` (marker rozpoczęcia nowego segmentu reasoning)
-- `plan_update` → patrz [Plan tool](#plan-tool-updateplanargs)
+- `agent_reasoning_section_break` → `{}` (marker that starts a new reasoning segment)
+- `plan_update` → see [Plan tool](#plan-tool-updateplanargs)
 
-**Konfiguracja i historia**
+**Configuration and history**
 - `session_configured` → `{ "session_id": ConversationId, "model": String, "reasoning_effort"?: ReasoningEffort, "history_log_id": u64, "history_entry_count": usize, "initial_messages"?: [EventMsg], "rollout_path": PathBuf }`
 - `conversation_path` → `{ "conversation_id": ConversationId, "path": PathBuf }`
 - `get_history_entry_response` → `{ "offset": usize, "log_id": u64, "entry"?: HistoryEntry }`
 
-**Zdarzenia MCP / narzędziowe**
+**MCP / tool events**
 - `mcp_tool_call_begin` → `{ "call_id": String, "invocation": McpInvocation }`
 - `mcp_tool_call_end` → `{ "call_id": String, "invocation": McpInvocation, "duration": Duration, "result": CallToolResult | String }`
 - `mcp_list_tools_response` → `{ "tools": { fullyQualifiedName: Tool } }`
@@ -233,7 +233,7 @@ Poniższa lista zawiera wszystkie warianty (wartość pola `type` → payload):
 - `web_search_begin` → `{ "call_id": String }`
 - `web_search_end` → `{ "call_id": String, "query": String }`
 
-**Komendy lokalne / shell**
+**Local commands / shell**
 - `exec_command_begin` → `{ "call_id": String, "command": [String], "cwd": PathBuf, "parsed_cmd": [ParsedCommand] }`
 - `exec_command_output_delta` → `{ "call_id": String, "stream": "stdout"|"stderr", "chunk": Base64 }`
 - `exec_command_end` → `{ "call_id": String, "stdout": String, "stderr": String, "aggregated_output": String, "exit_code": i32, "duration": Duration, "formatted_output": String }`
@@ -243,12 +243,12 @@ Poniższa lista zawiera wszystkie warianty (wartość pola `type` → payload):
 - `apply_patch_approval_request` → `{ "call_id": String, "changes": { path: FileChange }, "reason"?: String, "grant_root"?: PathBuf }`
 - `turn_diff` → `{ "unified_diff": String }`
 
-**Tryb review**
+**Review mode**
 - `entered_review_mode` → `ReviewRequest`
 - `exited_review_mode` → `{ "review_output"?: ReviewOutputEvent }`
 
-## Struktury powiązane ze zdarzeniami
-### TokenUsage i TokenUsageInfo
+## Structures associated with events
+### TokenUsage and TokenUsageInfo
 ```json
 {
   "total_token_usage": {
@@ -263,16 +263,16 @@ Poniższa lista zawiera wszystkie warianty (wartość pola `type` → payload):
 }
 ```
 - `TokenUsage.blended_total()` = `non_cached_input + output_tokens`.
-- Konstanta bazowa `BASELINE_TOKENS = 12000` służy do szacowania zajętości kontekstu.
+- The baseline constant `BASELINE_TOKENS = 12000` is used to estimate remaining context.
 
 ### ParsedCommand
-Wartości `type`: `read`, `list_files`, `search`, `unknown`. Pola:
+`type` values: `read`, `list_files`, `search`, `unknown`. Payloads:
 - `read { cmd: String, name: String }`
 - `list_files { cmd: String, path?: String }`
 - `search { cmd: String, query?: String, path?: String }`
 - `unknown { cmd: String }`
 
-### McpInvocation i CallToolResult
+### McpInvocation and CallToolResult
 ```json
 {
   "server": "todo",
@@ -280,9 +280,9 @@ Wartości `type`: `read`, `list_files`, `search`, `unknown`. Pola:
   "arguments": { ... } | null
 }
 ```
-`CallToolResult` pochodzi z `mcp_types` i odzwierciedla wynik MCP (sukces/błąd).
+`CallToolResult` comes from `mcp_types` and represents the MCP outcome (success or error).
 
-### Zmiany plików (`FileChange`)
+### File changes (`FileChange`)
 ```json
 {"type": "add", "content": "..."}
 {"type": "delete", "content": "..."}
@@ -291,7 +291,7 @@ Wartości `type`: `read`, `list_files`, `search`, `unknown`. Pola:
 
 ### Review
 - `ReviewRequest { "prompt": String, "user_facing_hint": String }`
-- `ReviewOutputEvent` zawiera:
+- `ReviewOutputEvent` contains:
   - `findings: [ReviewFinding]`
   - `overall_correctness: String`
   - `overall_explanation: String`
@@ -303,7 +303,7 @@ Wartości `type`: `read`, `list_files`, `search`, `unknown`. Pola:
 - `UpdatePlanArgs { explanation?: String, plan: [PlanItemArg] }`
 - `PlanItemArg { step: String, status: "pending" | "in_progress" | "completed" }`
 
-## Struktury odpowiedzi modelu (`models.rs`)
+## Model response structures (`models.rs`)
 ### `ResponseInputItem`
 - `message { role: String, content: [ContentItem] }`
 - `function_call_output { call_id: String, output: FunctionCallOutputPayload }`
@@ -319,11 +319,11 @@ Wartości `type`: `read`, `list_files`, `search`, `unknown`. Pola:
 - `custom_tool_call { id?: String, status?: String, call_id: String, name: String, input: String }`
 - `custom_tool_call_output { call_id: String, output: String }`
 - `web_search_call { id?: String, status?: String, action: WebSearchAction }`
-- `other` – dane nieobsługiwane.
+- `other` – unrecognized data.
 
-`ContentItem` typy: `input_text`, `input_image`, `output_text`. `ReasoningItemContent`: `reasoning_text`, `text`.
+`ContentItem` kinds: `input_text`, `input_image`, `output_text`. `ReasoningItemContent`: `reasoning_text`, `text`.
 
-`FunctionCallOutputPayload` serializuje się jako zwykły string (`content`). `success` służy tylko lokalnie.
+`FunctionCallOutputPayload` serializes as a plain string (`content`). The `success` flag is only used locally.
 
 ### Local shell
 - `LocalShellAction::Exec { command: [String], timeout_ms?: u64 (alias: timeout), working_directory?: String, env?: {k:v}, user?: String, with_escalated_permissions?: bool, justification?: String }`
@@ -332,13 +332,13 @@ Wartości `type`: `read`, `list_files`, `search`, `unknown`. Pola:
 ### Web search
 - `WebSearchAction::Search { query: String }`
 
-### Konwersja `InputItem` → `ResponseInputItem`
-`Vec<InputItem>` (np. w `ResponseInputItem::from`) jest zamieniane na wiadomość `role=user` z odpowiednimi `ContentItem`. Pliki lokalne zamieniają się w data URL (MIME wyznaczane przez `mime_guess`).
+### Converting `InputItem` → `ResponseInputItem`
+A `Vec<InputItem>` (e.g. inside `ResponseInputItem::from`) is turned into a message with `role = user` and the appropriate `ContentItem` entries. Local files are converted into data URLs (MIME type determined via `mime_guess`).
 
-## Historia i rollouty
+## History and rollouts
 - `InitialHistory`: `new`, `resumed { conversation_id, history: [RolloutItem], rollout_path }`, `forked([RolloutItem])`.
 - `ResumedHistory { conversation_id, history: [RolloutItem], rollout_path }`.
-- `RolloutItem` typy:
+- `RolloutItem` variants:
   - `session_meta(SessionMetaLine)`
   - `response_item(ResponseItem)`
   - `compacted(CompactedItem)`
@@ -349,25 +349,25 @@ Wartości `type`: `read`, `list_files`, `search`, `unknown`. Pola:
 - `SessionMetaLine { meta: SessionMeta, git?: GitInfo }`.
 - `GitInfo { commit_hash?, branch?, repository_url? }`.
 - `TurnContextItem { cwd: PathBuf, approval_policy: AskForApproval, sandbox_policy: SandboxPolicy, model: String, effort?: ReasoningEffort, summary: ReasoningSummary }`.
-- `CompactedItem { message: String }` może być traktowany jak `ResponseItem::Message` z rolą `assistant`.
+- `CompactedItem { message: String }` may be treated like `ResponseItem::Message` with `role = assistant`.
 
-`HistoryEntry { conversation_id: String, ts: u64, text: String }` zwracane w `GetHistoryEntryResponse`.
+`HistoryEntry { conversation_id: String, ts: u64, text: String }` is returned in `GetHistoryEntryResponse`.
 
 ## Plan tool (`UpdatePlanArgs`)
-Patrz sekcja [Plan tool](#plan-tool-updateplanargs). Umożliwia spójne aktualizowanie kroków planu przez `EventMsg::PlanUpdate`.
+See the [Plan tool](#plan-tool-updateplanargs) section. It ensures consistent plan updates via `EventMsg::PlanUpdate`.
 
-## Protokół MCP (JSON-RPC)
+## MCP protocol (JSON-RPC)
 ### Transport
-- MCP używa JSON-RPC 2.0 z metodami `camelCase`.
-- Każdy request przyjmuje pole `id` (`RequestId` – liczba całkowita lub string) i `params` (jeśli wymagane).
-- Odpowiedzi (`*Response`) mają taki sam `id` i zwykłą strukturę JSON-RPC (`result` / `error`).
-- Serwer może wysyłać:
-  - **ServerRequest** (metody `applyPatchApproval`, `execCommandApproval`) – wymagają odpowiedzi klienta.
-  - **ServerNotification** (`authStatusChange`, `loginChatGptComplete`) – jednostronne powiadomienia bez `id`.
+- MCP uses JSON-RPC 2.0 with `camelCase` method names.
+- Each request carries an `id` (`RequestId` – integer or string) and `params` when required.
+- Responses (`*Response`) reuse the same `id` and follow the standard JSON-RPC format (`result` / `error`).
+- The server may send:
+  - **ServerRequest** (`applyPatchApproval`, `execCommandApproval`) – require a client response.
+  - **ServerNotification** (`authStatusChange`, `loginChatGptComplete`) – one-way notifications without `id`.
 
-### Requests klienta (`ClientRequest`)
-| Metoda | Parametry | Wynik |
-|--------|-----------|-------|
+### Client requests (`ClientRequest`)
+| Method | Params | Result |
+|--------|--------|--------|
 | `newConversation` | `NewConversationParams { model?, profile?, cwd?, approval_policy?, sandbox?, config?, base_instructions?, include_plan_tool?, include_apply_patch_tool? }` | `NewConversationResponse { conversation_id, model, reasoning_effort?, rollout_path }`
 | `listConversations` | `ListConversationsParams { page_size?, cursor? }` | `ListConversationsResponse { items: [ConversationSummary], next_cursor? }`
 | `resumeConversation` | `ResumeConversationParams { path, overrides? }` | `ResumeConversationResponse { conversation_id, model, initial_messages? }`
@@ -379,62 +379,62 @@ Patrz sekcja [Plan tool](#plan-tool-updateplanargs). Umożliwia spójne aktualiz
 | `removeConversationListener` | `RemoveConversationListenerParams { subscription_id }` | `RemoveConversationListenerResponse {}`
 | `gitDiffToRemote` | `GitDiffToRemoteParams { cwd }` | `GitDiffToRemoteResponse { sha, diff }`
 | `loginApiKey` | `LoginApiKeyParams { api_key }` | `LoginApiKeyResponse {}`
-| `loginChatGpt` | brak | `LoginChatGptResponse { login_id, auth_url }`
+| `loginChatGpt` | none | `LoginChatGptResponse { login_id, auth_url }`
 | `cancelLoginChatGpt` | `CancelLoginChatGptParams { login_id }` | `CancelLoginChatGptResponse {}`
-| `logoutChatGpt` | brak | `LogoutChatGptResponse {}`
+| `logoutChatGpt` | none | `LogoutChatGptResponse {}`
 | `getAuthStatus` | `GetAuthStatusParams { include_token?, refresh_token? }` | `GetAuthStatusResponse { auth_method?, auth_token?, requires_openai_auth? }`
-| `getUserSavedConfig` | brak | `GetUserSavedConfigResponse { config: UserSavedConfig }`
+| `getUserSavedConfig` | none | `GetUserSavedConfigResponse { config: UserSavedConfig }`
 | `setDefaultModel` | `SetDefaultModelParams { model?, reasoning_effort? }` | `SetDefaultModelResponse {}`
-| `getUserAgent` | brak | `GetUserAgentResponse { user_agent }`
-| `userInfo` | brak | `UserInfoResponse { alleged_user_email? }`
+| `getUserAgent` | none | `GetUserAgentResponse { user_agent }`
+| `userInfo` | none | `UserInfoResponse { alleged_user_email? }`
 | `execOneOffCommand` | `ExecOneOffCommandParams { command, timeout_ms?, cwd?, sandbox_policy? }` | `ExecArbitraryCommandResponse { exit_code, stdout, stderr }`
 
-### ServerRequest (żądania od serwera)
-- `applyPatchApproval` → `ApplyPatchApprovalParams { conversation_id, call_id, file_changes, reason?, grant_root? }` – klient odpowiada `ApplyPatchApprovalResponse { decision }`.
-- `execCommandApproval` → `ExecCommandApprovalParams { conversation_id, call_id, command, cwd, reason? }` – klient odpowiada `ExecCommandApprovalResponse { decision }`.
+### ServerRequest (requests from the server)
+- `applyPatchApproval` → `ApplyPatchApprovalParams { conversation_id, call_id, file_changes, reason?, grant_root? }` – respond with `ApplyPatchApprovalResponse { decision }`.
+- `execCommandApproval` → `ExecCommandApprovalParams { conversation_id, call_id, command, cwd, reason? }` – respond with `ExecCommandApprovalResponse { decision }`.
 
 ### ServerNotification
 - `authStatusChange` → `{ "auth_method"?: "apiKey" | "chatGpt" }`
 - `loginChatGptComplete` → `{ "login_id": Uuid, "success": bool, "error"?: String }`
 
-### Konfiguracja użytkownika (`UserSavedConfig`)
-- Pola opcjonalne opisują preferowane ustawienia (policy, sandbox, model, profile, narzędzia).
+### User configuration (`UserSavedConfig`)
+- Optional fields describe preferred settings (policy, sandbox, model, profiles, tools).
 - `approval_policy?`, `sandbox_mode?`, `sandbox_settings?`, `model?`, `model_reasoning_effort?`, `model_reasoning_summary?`, `model_verbosity?`, `tools?`, `profile?`, `profiles`.
-- `profiles` to mapa `profil -> Profile { model?, model_provider?, approval_policy?, model_reasoning_*?, model_verbosity?, chatgpt_base_url? }`.
+- `profiles` is a map from profile name to `Profile { model?, model_provider?, approval_policy?, model_reasoning_*?, model_verbosity?, chatgpt_base_url? }`.
 - `tools`: `web_search?`, `view_image?` (bool).
-- `sandbox_settings`: jak w `SandboxPolicy::WorkspaceWrite`.
+- `sandbox_settings`: same structure as `SandboxPolicy::WorkspaceWrite`.
 
-### Typy wspólne MCP ↔ protokół
-- MCP używa tej samej definicji `InputItem`, `AskForApproval`, `SandboxPolicy`, `ReviewDecision`, `FileChange`, co kolejki SQ/EQ.
-- Wszystkie pola `camelCase` w MCP odpowiadają polom `snake_case` w wewnętrznym protokole.
+### Types shared between MCP and the protocol
+- MCP reuses the same definitions for `InputItem`, `AskForApproval`, `SandboxPolicy`, `ReviewDecision`, `FileChange` as the SQ/EQ queues.
+- All `camelCase` fields in MCP map to `snake_case` fields in the internal protocol.
 
-### Przykładowa sekwencja MCP
-1. Klient wysyła `newConversation` z ustalonym modelem.
-2. Po otrzymaniu `conversation_id` wysyła `addConversationListener` aby zasubskrybować zdarzenia.
-3. Wysyła `sendUserTurn` (z tym samym `conversation_id`).
-4. Serwer strumieniuje zdarzenia (`EventMsg` zakodowane np. jako JSON Lines lub SSE – implementacja transportu zależy od warstwy klienckiej) oraz ewentualne `ServerRequest` (zatwierdzenia).
-5. Klient odpowiada `applyPatchApproval` / `execCommandApproval` zgodnie z decyzją użytkownika.
-6. Po zakończeniu pracy – opcjonalne `interruptConversation` lub `archiveConversation`.
+### Example MCP sequence
+1. The client sends `newConversation` with the chosen model.
+2. After receiving `conversation_id`, it sends `addConversationListener` to subscribe to events.
+3. It sends `sendUserTurn` (using the same `conversation_id`).
+4. The server streams events (`EventMsg` encoded as JSON Lines or SSE—transport depends on the client layer) plus any `ServerRequest` approvals.
+5. The client replies to `applyPatchApproval` / `execCommandApproval` according to the user’s decision.
+6. When finished, it may call `interruptConversation` or `archiveConversation`.
 
-## Przebieg tury (SQ/EQ)
-1. **Submission**: klient publikuje `Submission` (`user_turn` lub `user_input`).
-2. **Echo input**: agent wysyła `EventMsg::UserMessage` (co zostało przekazane modelowi) oraz `SessionConfigured` przy starcie. Wyjątek: w trybie review syntetyczna wiadomość startowa (powstała z `Op::Review`) nie jest emitowana jako `UserMessage`; interfejs dostaje tylko `EnteredReviewMode`.
-3. **Stream reasoning**: `AgentMessageDelta`, `AgentReasoningDelta`, `TokenCount` itd. pojawiają się asynchronicznie.
-4. **Narzędzia**: gdy model uruchamia polecenia lub narzędzia MCP, pojawiają się `ExecCommand*`, `McpToolCall*`, `WebSearch*`, `PlanUpdate`.
-5. **Zgody**: jeżeli konieczna zgoda użytkownika, agent wysyła `ExecApprovalRequest` / `ApplyPatchApprovalRequest`. Klient musi odpowiedzieć `exec_approval` / `patch_approval`.
-6. **Zakończenie**: `TaskComplete` + opcjonalnie `TurnDiff`, `TokenCount`. Błąd powoduje `Error` / `TurnAborted`.
-7. **Historia**: klient może zainicjować `get_path` lub `get_history_entry_request` aby odczytać logi.
+## Turn lifecycle (SQ/EQ)
+1. **Submission:** the client publishes a `Submission` (`user_turn` or `user_input`).
+2. **Echo input:** the agent emits `EventMsg::UserMessage` (echoing what went to the model) and `SessionConfigured` at startup. Exception: in review mode the synthetic starting message (generated from `Op::Review`) is not emitted as `UserMessage`; only `EnteredReviewMode` appears.
+3. **Stream reasoning:** `AgentMessageDelta`, `AgentReasoningDelta`, `TokenCount`, etc. arrive asynchronously.
+4. **Tools:** when the model launches commands or MCP tools, expect `ExecCommand*`, `McpToolCall*`, `WebSearch*`, `PlanUpdate`.
+5. **Approvals:** if approval is required, the agent emits `ExecApprovalRequest` / `ApplyPatchApprovalRequest`. The client must answer with `exec_approval` / `patch_approval`.
+6. **Completion:** `TaskComplete` plus optional `TurnDiff`, `TokenCount`. Errors produce `Error` / `TurnAborted`.
+7. **History:** the client can call `get_path` or `get_history_entry_request` to read logs.
 
-## Uwagi implementacyjne
-- Warto używać UUID-ów (lub monotonie rosnących stringów) jako `Submission.id` aby uniknąć kolizji.
-- Obsługuj wiele zdarzeń dla jednego `id` – `TaskStarted`, `AgentMessageDelta`, `TaskComplete` będą miały ten sam identyfikator.
-- Przy dekodowaniu `Result<CallToolResult, String>` (np. w `McpToolCallEndEvent.result`) pamiętaj, że w JSON wynik może być obiektem narzędzia lub stringiem błędu.
-- `ExecCommandOutputDeltaEvent.chunk` należy dekodować z base64 zanim pokaże się użytkownikowi.
-- `SessionConfigured.initial_messages` może zawierać listę pełnych `EventMsg`; traktuj je tak samo jak normalne zdarzenia.
-- `OverrideTurnContext.effort` przyjmuje trzy stany: brak (bez zmian), `null` (wyczyść), jedna z wartości `ReasoningEffort` (ustaw).
-- Przy integracji MCP pamiętaj o utrzymywaniu subskrypcji (`removeConversationListener`) oraz obsłudze wielokrotnych rozmów równocześnie.
-- Rolling log (`rollout_path`) jest plikiem JSONL – każdy wiersz to `RolloutLine`.
-- Gdy sandbox ma `workspace_write`, serwer automatycznie dodaje bieżące `cwd`, `/tmp` (jeśli istnieje) i `$TMPDIR` (chyba że wyłączone flagami) do listy zapisu.
+## Implementation notes
+- Prefer UUIDs (or monotonically increasing strings) for `Submission.id` to avoid collisions.
+- Expect multiple events per `id`—`TaskStarted`, `AgentMessageDelta`, `TaskComplete` all share the same identifier.
+- When decoding `Result<CallToolResult, String>` (e.g. `McpToolCallEndEvent.result`), remember the JSON payload may be either a tool object or an error string.
+- Decode `ExecCommandOutputDeltaEvent.chunk` from Base64 before displaying it.
+- `SessionConfigured.initial_messages` may contain a list of full `EventMsg`; treat them the same as regular events.
+- `OverrideTurnContext.effort` has three states: absent (leave unchanged), `null` (clear), or one of the `ReasoningEffort` values (set).
+- With MCP integration, maintain subscriptions (`removeConversationListener`) and handle multiple conversations concurrently.
+- The rolling log (`rollout_path`) is a JSONL file—each line is a `RolloutLine`.
+- When the sandbox mode is `workspace_write`, the server automatically adds the current `cwd`, `/tmp` (if it exists), and `$TMPDIR` (unless disabled by flags) to the writable list.
 
-## Podsumowanie
-Dokument ten definiuje wszystkie struktury danych, enumeracje i przebiegi wymagane do zbudowania klienta, który komunikuje się z Codexem przez kolejki `Submission`/`Event` lub interfejs MCP. Implementacja powinna ściśle przestrzegać przedstawionych nazw pól, wartości `type` oraz formatów JSON, aby zachować kompatybilność z istniejącymi komponentami Codexa.
+## Summary
+This document defines all data structures, enumerations, and flows required to build a client that communicates with Codex through the `Submission`/`Event` queues or the MCP interface. An implementation must strictly follow the field names, `type` values, and JSON formats presented here to remain compatible with existing Codex components.
