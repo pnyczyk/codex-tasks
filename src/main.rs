@@ -10,6 +10,9 @@ use crate::cli::{
     ArchiveArgs, Cli, Command, LogArgs, LsArgs, SendArgs, StartArgs, StatusArgs, StopArgs,
     WorkerArgs,
 };
+use crate::storage::TaskStore;
+use crate::task::{TaskMetadata, TaskState};
+use crate::worker::launcher::{WorkerLaunchRequest, spawn_worker};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -29,8 +32,32 @@ fn dispatch(cli: Cli) -> Result<()> {
     }
 }
 
-fn handle_start(_args: StartArgs) -> Result<()> {
-    not_implemented("start")
+fn handle_start(args: StartArgs) -> Result<()> {
+    let StartArgs { title, prompt } = args;
+
+    let store = TaskStore::default().context("failed to locate task store")?;
+    store
+        .ensure_layout()
+        .context("failed to prepare task store layout")?;
+
+    let task_id = store.generate_task_id();
+    let task_paths = store.task(task_id.clone());
+
+    let mut metadata = TaskMetadata::new(task_id.clone(), title.clone(), TaskState::Running);
+    metadata.initial_prompt = prompt.clone();
+
+    store
+        .save_metadata(&metadata)
+        .with_context(|| format!("failed to persist metadata for task {task_id}"))?;
+
+    let mut request = WorkerLaunchRequest::new(task_paths);
+    request.title = title;
+    request.prompt = prompt;
+    let _child = spawn_worker(request).context("failed to launch worker process")?;
+
+    println!("{task_id}");
+
+    Ok(())
 }
 
 fn handle_send(_args: SendArgs) -> Result<()> {

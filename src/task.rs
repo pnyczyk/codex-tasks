@@ -34,6 +34,8 @@ pub struct TaskMetadata {
     pub updated_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_result: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_prompt: Option<String>,
 }
 
 impl TaskMetadata {
@@ -47,6 +49,7 @@ impl TaskMetadata {
             created_at: now,
             updated_at: now,
             last_result: None,
+            initial_prompt: None,
         }
     }
 }
