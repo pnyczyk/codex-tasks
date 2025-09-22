@@ -1,14 +1,15 @@
 use std::collections::VecDeque;
 use std::convert::TryFrom;
-use std::ffi::CString;
+use std::ffi::{CString, OsString};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use chrono::{TimeZone, Utc};
@@ -630,6 +631,261 @@ fn archive_rejects_running_task() {
         .stderr(predicates::str::contains(
             "task task-running is RUNNING; stop it before archiving",
         ));
+}
+
+#[test]
+fn end_to_end_task_lifecycle_flow() {
+    let env = IntegrationTestEnv::new();
+
+    let task_id = env.start_task("Lifecycle Task", "first prompt");
+
+    let record = env.wait_for_condition(&task_id, |value| {
+        value["state"] == "IDLE" && value["last_result"].as_str().is_some()
+    });
+    assert_eq!(record["last_result"], "response 1: first prompt");
+    assert_eq!(record["last_prompt"], "first prompt");
+
+    let mut send = env.command();
+    send.args(["send", &task_id, "second prompt"]);
+    send.assert().success();
+
+    let record = env.wait_for_condition(&task_id, |value| {
+        value["state"] == "IDLE" && value["last_result"] == "response 2: second prompt"
+    });
+    assert_eq!(record["last_prompt"], "second prompt");
+
+    let mut status = env.command();
+    status.args(["status", "--json", &task_id]);
+    let output = status.assert().success().get_output().stdout.clone();
+    let value: Value = serde_json::from_slice(&output).expect("valid json");
+    assert_eq!(value["state"], "IDLE");
+    assert_eq!(value["last_result"], "response 2: second prompt");
+    assert_eq!(value["location"], "active");
+
+    let mut log = env.command();
+    log.args(["log", "-n", "20", &task_id]);
+    let log_output =
+        String::from_utf8(log.assert().success().get_output().stdout.clone()).expect("stdout utf8");
+    assert!(log_output.contains("response 1: first prompt"));
+    assert!(log_output.contains("response 2: second prompt"));
+
+    let mut stop = env.command();
+    stop.args(["stop", &task_id]);
+    let stop_assert = stop.assert().success();
+    let stop_output =
+        String::from_utf8(stop_assert.get_output().stdout.clone()).expect("stdout utf8");
+    assert!(stop_output.contains("stopped"));
+
+    env.wait_for_condition(&task_id, |value| value["state"] == "STOPPED");
+
+    let mut archive = env.command();
+    archive.args(["archive", &task_id]);
+    archive.assert().success();
+
+    let archived = env.wait_for_condition(&task_id, |value| value["state"] == "ARCHIVED");
+    assert_eq!(archived["location"], "archived");
+    assert_eq!(archived["last_result"], "response 2: second prompt");
+}
+
+#[test]
+fn status_reports_died_after_worker_killed() {
+    let env = IntegrationTestEnv::with_delay(3000);
+
+    let task_id = env.start_task("Fragile Task", "initial prompt");
+    let pid = env.wait_for_pid(&task_id);
+
+    let kill_result = unsafe { libc::kill(pid, libc::SIGKILL) };
+    assert_eq!(kill_result, 0, "failed to send SIGKILL to worker");
+
+    let pid_path = env.tasks_root().join(&task_id).join("task.pid");
+    fs::remove_file(&pid_path).expect("remove pid after crash");
+
+    let died = env.wait_for_condition(&task_id, |value| value["state"] == "DIED");
+    assert_eq!(died["location"], "active");
+    assert_eq!(died["last_prompt"], "initial prompt");
+}
+
+const FAKE_CODEX_SCRIPT: &str = r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+import time
+
+ROOT = os.path.abspath(os.environ.get("FAKE_CODEX_ROOT", "."))
+DELAY_MS = int(os.environ.get("FAKE_CODEX_DELAY_MS", "0"))
+
+
+def send(event):
+    sys.stdout.write(json.dumps(event) + "\n")
+    sys.stdout.flush()
+
+
+send(
+    {
+        "id": "sub-0000000000",
+        "msg": {
+            "type": "session_configured",
+            "session_id": "00000000-0000-0000-0000-000000000000",
+            "model": "fake-model",
+            "history_log_id": 0,
+            "history_entry_count": 0,
+            "rollout_path": os.path.join(ROOT, "rollout.json"),
+        },
+    }
+)
+
+turn = 0
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    data = json.loads(line)
+    submission_id = data.get("id", "sub-unknown")
+    op = data.get("op", {})
+    op_type = op.get("type")
+    if op_type == "user_input":
+        parts = []
+        for item in op.get("items", []):
+            if item.get("type") == "text":
+                parts.append(item.get("text", ""))
+        prompt = " ".join(parts)
+        turn += 1
+        response = f"response {turn}: {prompt}"
+        send({"id": submission_id, "msg": {"type": "task_started", "model_context_window": None}})
+        if DELAY_MS > 0:
+            time.sleep(DELAY_MS / 1000.0)
+        send({"id": submission_id, "msg": {"type": "agent_message", "message": response}})
+        send(
+            {
+                "id": submission_id,
+                "msg": {"type": "task_complete", "last_agent_message": response},
+            }
+        )
+    elif op_type == "shutdown":
+        send({"id": submission_id, "msg": {"type": "shutdown_complete"}})
+        break
+    else:
+        send(
+            {
+                "id": submission_id,
+                "msg": {"type": "error", "message": f"unsupported op {op_type}"},
+            }
+        )
+"#;
+
+struct IntegrationTestEnv {
+    home: TempDir,
+    path: OsString,
+    extra_envs: Vec<(String, String)>,
+}
+
+impl IntegrationTestEnv {
+    fn new() -> Self {
+        Self::with_optional_delay(None)
+    }
+
+    fn with_delay(delay_ms: u64) -> Self {
+        Self::with_optional_delay(Some(delay_ms))
+    }
+
+    fn with_optional_delay(delay_ms: Option<u64>) -> Self {
+        let home = tempdir().expect("tempdir");
+        let bin_dir = home.path().join("bin");
+        write_fake_codex(&bin_dir);
+
+        let base_path = std::env::var_os("PATH").unwrap_or_else(|| OsString::from(""));
+        let mut path = OsString::new();
+        path.push(bin_dir.as_os_str());
+        path.push(":");
+        path.push(&base_path);
+
+        let mut extra_envs = vec![(
+            "FAKE_CODEX_ROOT".to_string(),
+            home.path().to_str().expect("home path utf8").to_string(),
+        )];
+        if let Some(delay) = delay_ms {
+            extra_envs.push(("FAKE_CODEX_DELAY_MS".to_string(), delay.to_string()));
+        }
+
+        Self {
+            home,
+            path,
+            extra_envs,
+        }
+    }
+
+    fn command(&self) -> Command {
+        let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+        cmd.env("HOME", self.home.path());
+        cmd.env("PATH", &self.path);
+        for (key, value) in &self.extra_envs {
+            cmd.env(key, value);
+        }
+        cmd
+    }
+
+    fn start_task(&self, title: &str, prompt: &str) -> String {
+        let mut cmd = self.command();
+        cmd.args(["start", "--title", title, prompt]);
+        let assert = cmd.assert().success();
+        let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+        stdout.trim().to_string()
+    }
+
+    fn wait_for_condition<F>(&self, task_id: &str, mut predicate: F) -> Value
+    where
+        F: FnMut(&Value) -> bool,
+    {
+        let start = Instant::now();
+        loop {
+            let value = self.status_json(task_id);
+            if predicate(&value) {
+                return value;
+            }
+            if start.elapsed() > Duration::from_secs(10) {
+                panic!("timed out waiting for condition on task {}", task_id);
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn wait_for_pid(&self, task_id: &str) -> i32 {
+        let pid_path = self.tasks_root().join(task_id).join("task.pid");
+        let start = Instant::now();
+        loop {
+            if let Ok(contents) = fs::read_to_string(&pid_path) {
+                if let Ok(pid) = contents.trim().parse::<i32>() {
+                    return pid;
+                }
+            }
+            if start.elapsed() > Duration::from_secs(5) {
+                panic!("timed out waiting for pid file at {:?}", pid_path);
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn status_json(&self, task_id: &str) -> Value {
+        let mut cmd = self.command();
+        cmd.args(["status", "--json", task_id]);
+        let output = cmd.assert().success().get_output().stdout.clone();
+        serde_json::from_slice(&output).expect("valid json")
+    }
+
+    fn tasks_root(&self) -> PathBuf {
+        self.home.path().join(".codex").join("tasks")
+    }
+}
+
+fn write_fake_codex(bin_dir: &Path) {
+    fs::create_dir_all(bin_dir).expect("bin dir");
+    let script_path = bin_dir.join("codex");
+    fs::write(&script_path, FAKE_CODEX_SCRIPT).expect("write fake codex script");
+    let mut perms = fs::metadata(&script_path)
+        .expect("script metadata")
+        .permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&script_path, perms).expect("set permissions");
 }
 
 fn write_metadata(tasks_dir: &Path, task_id: &str, state: &str) {
