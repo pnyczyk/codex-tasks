@@ -47,11 +47,11 @@ codex-tasks archive <task_id>
 - After graceful exit, status becomes `STOPPED`.
 
 ### 3.6 `ls`
-- List all tasks in `~/.codex/tasks/` plus archived entries in `done/YYYY/MM/DD/`.
+- List all tasks in `~/.codex/tasks/` plus archived entries in `archive/YYYY/MM/DD/`.
 - Optional `--state` filters (multiple allowed).
 
 ### 3.7 `archive`
-- Move task files into `done/<YYYY>/<MM>/<DD>/<task_id>/`.
+- Move task files into `archive/<YYYY>/<MM>/<DD>/<task_id>/`.
 - Status becomes `ARCHIVED`.
 
 ## 4. Task data model
@@ -62,14 +62,19 @@ codex-tasks archive <task_id>
 - `last_result`: UTF-8 text of the most recent Codex answer (available in `IDLE`, `STOPPED`, `ARCHIVED`).
 
 ## 5. Filesystem layout (`~/.codex/tasks/`)
+- Active tasks live under `~/.codex/tasks/<task_id>/`, keeping related files grouped together.
+- Each task directory stores `task.pid`, `task.pipe`, `task.log`, `task.result`, and `task.json`.
+- Archived tasks move to `~/.codex/tasks/archive/<YYYY>/<MM>/<DD>/<task_id>/` with the same filenames.
+
 ```
 ~/.codex/tasks/
-  <task_id>.pid       # PID of worker process
-  <task_id>.pipe      # FIFO for prompts
-  <task_id>.log       # rendered transcript
-  <task_id>.result    # latest result (if any)
-  meta.json?          # optional metadata cache (future work)
-  done/<YYYY>/<MM>/<DD>/<task_id>/...  # archived copies of the above files
+  <task_id>/
+    task.pid
+    task.pipe
+    task.log
+    task.result
+    task.json
+  archive/<YYYY>/<MM>/<DD>/<task_id>/...
 ```
 - When a task is STOPPED or DIED, `.pid` and `.pipe` are removed; log/result remain.
 - LOG format matches current `codex-task` output (timestamps, headings, reasoning blocks, etc.).
@@ -91,13 +96,13 @@ codex-tasks archive <task_id>
 RUNNING → IDLE (on successful completion)
 stop → STOPPED (after graceful shutdown)
 worker crash / missing PID → DIED
-archive → ARCHIVED (files moved to done/…)
+archive → ARCHIVED (files moved to archive/…)
 ```
 
 ## 8. Error handling & logging
 - All Codex interaction logs go to `<task_id>.log` (exact renderer from `codex-task`).
 - `status` detects:
-  - Missing `.pid` but existing `.log` ⇒ `DIED`.
+  - Missing `task.pid` but existing log ⇒ `DIED`.
   - Archived tasks based on directory location.
 - CLI commands exit non-zero with a clear message if:
   - Task ID not found.

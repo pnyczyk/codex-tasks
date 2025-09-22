@@ -5,7 +5,6 @@ pub mod task;
 pub mod worker;
 
 use std::collections::VecDeque;
-use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, ErrorKind, Write};
 use std::os::fd::AsRawFd;
@@ -14,7 +13,8 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
+use chrono::Utc;
 use clap::Parser;
 use libc::{ENXIO, O_NONBLOCK};
 
@@ -23,9 +23,9 @@ use crate::cli::{
     WorkerArgs,
 };
 use crate::status::{StatusCommandOptions, StatusFormat};
-use crate::storage::{TaskPaths, TaskStore};
+use crate::storage::{LOG_FILE_NAME, METADATA_FILE_NAME, TaskPaths, TaskStore};
 use crate::task::{TaskMetadata, TaskState};
-use crate::worker::launcher::{spawn_worker, WorkerLaunchRequest};
+use crate::worker::launcher::{WorkerLaunchRequest, spawn_worker};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -81,10 +81,16 @@ fn handle_send(args: SendArgs) -> Result<()> {
     let metadata = match store.load_metadata(task_id.clone()) {
         Ok(metadata) => metadata,
         Err(err) => {
-            if err
+            let not_found = err
                 .downcast_ref::<std::io::Error>()
-                .is_some_and(|io_err| io_err.kind() == ErrorKind::NotFound)
-            {
+                .is_some_and(|io_err| io_err.kind() == ErrorKind::NotFound);
+            if not_found {
+                if let Some((_, archived_metadata)) = store.find_archived_task(&task_id)? {
+                    bail!(
+                        "task {} is ARCHIVED and cannot receive prompts",
+                        archived_metadata.id
+                    );
+                }
                 bail!("task {task_id} was not found");
             }
             return Err(err);
@@ -273,8 +279,72 @@ fn handle_ls(args: LsArgs) -> Result<()> {
     Ok(())
 }
 
-fn handle_archive(_args: ArchiveArgs) -> Result<()> {
-    not_implemented("archive")
+fn handle_archive(args: ArchiveArgs) -> Result<()> {
+    let store = TaskStore::default()?;
+    store.ensure_layout()?;
+
+    if let Some((_, metadata)) = store.find_archived_task(&args.task_id)? {
+        println!("Task {} is already archived.", metadata.id);
+        return Ok(());
+    }
+
+    let paths = store.task(args.task_id.clone());
+    let mut metadata = match paths.read_metadata() {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            let not_found = err
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io_err| io_err.kind() == ErrorKind::NotFound);
+            if not_found {
+                bail!("task {} was not found", args.task_id);
+            }
+            return Err(err);
+        }
+    };
+
+    if metadata.state == TaskState::Running {
+        bail!("task {} is RUNNING; stop it before archiving", metadata.id);
+    }
+
+    if let Some(pid) = paths.read_pid()? {
+        if is_process_running(pid)? {
+            bail!("task {} is RUNNING; stop it before archiving", metadata.id);
+        }
+    }
+
+    paths.remove_pid()?;
+    paths.remove_pipe()?;
+
+    let now = Utc::now();
+    metadata.state = TaskState::Archived;
+    metadata.updated_at = now;
+    paths.write_metadata(&metadata)?;
+
+    let bucket = store.ensure_archive_bucket(now)?;
+    let destination = bucket.join(&metadata.id);
+    if destination.exists() {
+        bail!(
+            "archive destination {} already exists for task {}",
+            destination.display(),
+            metadata.id
+        );
+    }
+
+    fs::rename(paths.directory(), &destination).with_context(|| {
+        format!(
+            "failed to move task {} into archive at {}",
+            metadata.id,
+            destination.display()
+        )
+    })?;
+
+    println!(
+        "Task {} archived to {}.",
+        metadata.id,
+        destination.display()
+    );
+
+    Ok(())
 }
 
 fn handle_worker(args: WorkerArgs) -> Result<()> {
@@ -291,6 +361,7 @@ fn handle_worker(args: WorkerArgs) -> Result<()> {
         .block_on(crate::worker::child::run_worker(config))
 }
 
+#[allow(dead_code)]
 fn not_implemented(command: &str) -> Result<()> {
     bail!("`{command}` is not implemented yet. Track progress in future issues.")
 }
@@ -428,13 +499,16 @@ fn collect_active_tasks(store: &TaskStore) -> Result<Vec<ListedTask>> {
         let file_type = entry
             .file_type()
             .with_context(|| format!("failed to inspect {}", path.display()))?;
-        if file_type.is_dir() {
+        if !file_type.is_dir() {
             continue;
         }
-        if path.extension() != Some(OsStr::new("json")) {
+
+        let metadata_path = path.join(METADATA_FILE_NAME);
+        if !metadata_path.exists() {
             continue;
         }
-        let metadata = read_metadata_file(&path)?;
+
+        let metadata = read_metadata_file(&metadata_path)?;
         tasks.push(ListedTask {
             metadata,
             archived: false,
@@ -451,29 +525,26 @@ fn collect_archived_tasks(store: &TaskStore) -> Result<Vec<ListedTask>> {
         return Ok(tasks);
     }
 
-    let mut stack = vec![archive_root];
-    while let Some(dir) = stack.pop() {
+    let mut queue = VecDeque::from([archive_root]);
+    while let Some(dir) = queue.pop_front() {
+        let metadata_path = dir.join(METADATA_FILE_NAME);
+        if metadata_path.exists() {
+            let metadata = read_metadata_file(&metadata_path)?;
+            tasks.push(ListedTask {
+                metadata,
+                archived: true,
+            });
+            continue;
+        }
+
         for entry in fs::read_dir(&dir)
             .with_context(|| format!("failed to read archive directory {}", dir.display()))?
         {
             let entry = entry
                 .with_context(|| format!("failed to read archive entry in {}", dir.display()))?;
-            let path = entry.path();
-            let file_type = entry
-                .file_type()
-                .with_context(|| format!("failed to inspect {}", path.display()))?;
-            if file_type.is_dir() {
-                stack.push(path);
-                continue;
+            if entry.file_type()?.is_dir() {
+                queue.push_back(entry.path());
             }
-            if path.extension() != Some(OsStr::new("json")) {
-                continue;
-            }
-            let metadata = read_metadata_file(&path)?;
-            tasks.push(ListedTask {
-                metadata,
-                archived: true,
-            });
         }
     }
 
@@ -486,12 +557,16 @@ fn read_metadata_file(path: &Path) -> Result<TaskMetadata> {
     let metadata: TaskMetadata = serde_json::from_str(&raw)
         .with_context(|| format!("failed to parse metadata file {}", path.display()))?;
 
-    if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
+    if let Some(parent) = path
+        .parent()
+        .and_then(|value| value.file_name())
+        .and_then(|value| value.to_str())
+    {
         ensure!(
-            metadata.id == stem,
-            "metadata id {} does not match filename {}",
+            metadata.id == parent,
+            "metadata id {} does not match directory {}",
             metadata.id,
-            stem
+            parent
         );
     }
 
@@ -552,7 +627,7 @@ fn find_archived_log_path(store: &TaskStore, task_id: &str) -> Result<Option<Pat
                     .map(|name| name == task_id)
                     .unwrap_or(false)
                 {
-                    let candidate = path.join(format!("{task_id}.log"));
+                    let candidate = path.join(LOG_FILE_NAME);
                     if candidate.exists() {
                         return Ok(Some(candidate));
                     }
