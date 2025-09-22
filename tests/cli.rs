@@ -41,7 +41,6 @@ fn unfinished_subcommands_return_not_implemented_errors() {
         .stderr(predicates::str::contains("`ls` is not implemented yet"));
 }
 
-#[test]
 fn start_command_creates_task_and_launches_worker() {
     let tmp = tempdir().expect("tempdir");
 
@@ -225,6 +224,19 @@ fn send_errors_when_pipe_has_no_reader() {
         .failure()
         .stderr(predicates::str::contains(
             "task no-reader-task is not accepting prompts; the worker may have STOPPED, DIED, or been ARCHIVED",
+        ));
+}
+
+#[test]
+fn stop_handles_missing_task_gracefully() {
+    let tmp = tempdir().expect("tempdir");
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    cmd.env("HOME", tmp.path())
+        .args(["stop", "task-xyz"]);
+    cmd.assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "Task task-xyz is not running; nothing to stop.",
         ));
 }
 
