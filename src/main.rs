@@ -3,7 +3,10 @@ pub mod storage;
 pub mod task;
 pub mod worker;
 
-use anyhow::{Context, Result, bail};
+use std::fs::OpenOptions;
+use std::io::{ErrorKind, Write};
+
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 
 use crate::cli::{
@@ -12,7 +15,7 @@ use crate::cli::{
 };
 use crate::storage::TaskStore;
 use crate::task::{TaskMetadata, TaskState};
-use crate::worker::launcher::{WorkerLaunchRequest, spawn_worker};
+use crate::worker::launcher::{spawn_worker, WorkerLaunchRequest};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -60,8 +63,64 @@ fn handle_start(args: StartArgs) -> Result<()> {
     Ok(())
 }
 
-fn handle_send(_args: SendArgs) -> Result<()> {
-    not_implemented("send")
+fn handle_send(args: SendArgs) -> Result<()> {
+    let store = TaskStore::default().context("failed to locate task store")?;
+    let task_id = args.task_id;
+    let prompt = args.prompt;
+
+    let metadata = match store.load_metadata(task_id.clone()) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            if err
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io_err| io_err.kind() == ErrorKind::NotFound)
+            {
+                bail!("task {task_id} was not found");
+            }
+            return Err(err);
+        }
+    };
+
+    match metadata.state {
+        TaskState::Archived => {
+            bail!(
+                "task {} is ARCHIVED and cannot receive prompts",
+                metadata.id
+            )
+        }
+        TaskState::Stopped => {
+            bail!("task {} is STOPPED and cannot receive prompts", metadata.id)
+        }
+        TaskState::Died => {
+            bail!("task {} has DIED and cannot receive prompts", metadata.id)
+        }
+        TaskState::Idle | TaskState::Running => {}
+    }
+
+    let paths = store.task(task_id.clone());
+    let pipe_path = paths.pipe_path();
+    let mut pipe = match OpenOptions::new().write(true).open(&pipe_path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            bail!(
+                "prompt pipe for task {} is missing; the worker may have stopped or exited",
+                metadata.id
+            )
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to open prompt pipe at {}", pipe_path.display()));
+        }
+    };
+
+    pipe.write_all(prompt.as_bytes())
+        .with_context(|| format!("failed to write prompt to {}", pipe_path.display()))?;
+    pipe.write_all(b"\n")
+        .with_context(|| format!("failed to write newline to {}", pipe_path.display()))?;
+    pipe.flush()
+        .with_context(|| format!("failed to flush prompt pipe at {}", pipe_path.display()))?;
+
+    Ok(())
 }
 
 fn handle_status(_args: StatusArgs) -> Result<()> {
