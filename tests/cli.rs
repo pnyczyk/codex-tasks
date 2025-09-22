@@ -109,7 +109,7 @@ fn send_returns_error_for_missing_task() {
 }
 
 #[test]
-fn send_rejects_inactive_states() {
+fn send_rejects_stopped_tasks() {
     let tmp = tempdir().expect("tempdir");
     let tasks_dir = tmp.path().join(".codex").join("tasks");
     fs::create_dir_all(&tasks_dir).expect("tasks dir");
@@ -139,6 +139,23 @@ fn send_rejects_died_tasks() {
         .args(["send", task_id, "prompt"]);
     cmd.assert().failure().stderr(predicates::str::contains(
         "task died-task has DIED and cannot receive prompts",
+    ));
+}
+
+#[test]
+fn send_rejects_archived_tasks() {
+    let tmp = tempdir().expect("tempdir");
+    let tasks_dir = tmp.path().join(".codex").join("tasks");
+    fs::create_dir_all(&tasks_dir).expect("tasks dir");
+
+    let task_id = "archived-task";
+    write_metadata(&tasks_dir, task_id, "ARCHIVED");
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    cmd.env("HOME", tmp.path())
+        .args(["send", task_id, "prompt"]);
+    cmd.assert().failure().stderr(predicates::str::contains(
+        "task archived-task is ARCHIVED and cannot receive prompts",
     ));
 }
 
@@ -188,9 +205,32 @@ fn send_errors_when_pipe_missing() {
     let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
     cmd.env("HOME", tmp.path())
         .args(["send", task_id, "prompt"]);
-    cmd.assert().failure().stderr(predicates::str::contains(
-        "prompt pipe for task missing-pipe-task is missing; the worker may have stopped or exited",
-    ));
+    cmd.assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "prompt pipe for task missing-pipe-task is missing; the worker may have STOPPED, DIED, or been ARCHIVED",
+        ));
+}
+
+#[test]
+fn send_errors_when_pipe_has_no_reader() {
+    let tmp = tempdir().expect("tempdir");
+    let tasks_dir = tmp.path().join(".codex").join("tasks");
+    fs::create_dir_all(&tasks_dir).expect("tasks dir");
+
+    let task_id = "no-reader-task";
+    write_metadata(&tasks_dir, task_id, "IDLE");
+    let pipe_path = tasks_dir.join(format!("{task_id}.pipe"));
+    create_pipe(&pipe_path);
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    cmd.env("HOME", tmp.path())
+        .args(["send", task_id, "prompt"]);
+    cmd.assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "task no-reader-task is not accepting prompts; the worker may have STOPPED, DIED, or been ARCHIVED",
+        ));
 }
 
 fn write_metadata(tasks_dir: &Path, task_id: &str, state: &str) {
