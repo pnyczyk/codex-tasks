@@ -4,12 +4,13 @@ pub mod storage;
 pub mod task;
 pub mod worker;
 
+use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, BufRead, BufReader, ErrorKind, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -200,8 +201,22 @@ fn handle_status(args: StatusArgs) -> Result<()> {
     })
 }
 
-fn handle_log(_args: LogArgs) -> Result<()> {
-    not_implemented("log")
+fn handle_log(args: LogArgs) -> Result<()> {
+    let store = TaskStore::default()?;
+    let log_path = resolve_log_path(&store, &args.task_id)?;
+    let file = File::open(&log_path).with_context(|| {
+        format!(
+            "failed to open log for task {} at {}",
+            args.task_id,
+            log_path.display()
+        )
+    })?;
+    let mut reader = BufReader::new(file);
+    print_initial_log(&mut reader, args.lines)?;
+    if args.follow {
+        follow_log(&mut reader)?;
+    }
+    Ok(())
 }
 
 fn handle_stop(args: StopArgs) -> Result<()> {
@@ -481,6 +496,160 @@ fn read_metadata_file(path: &Path) -> Result<TaskMetadata> {
     }
 
     Ok(metadata)
+}
+
+fn resolve_log_path(store: &TaskStore, task_id: &str) -> Result<PathBuf> {
+    let active_path = store.task(task_id.to_string()).log_path();
+    if active_path.exists() {
+        return Ok(active_path);
+    }
+
+    if let Some(path) = find_archived_log_path(store, task_id)? {
+        return Ok(path);
+    }
+
+    bail!(
+        "log file for task {task_id} was not found under {} or {}",
+        store.root().display(),
+        store.archive_root().display()
+    )
+}
+
+fn find_archived_log_path(store: &TaskStore, task_id: &str) -> Result<Option<PathBuf>> {
+    let archive_root = store.archive_root();
+    if !archive_root.exists() {
+        return Ok(None);
+    }
+
+    let mut stack = vec![archive_root];
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to read archive directory {}", dir.display())
+                });
+            }
+        };
+
+        for entry in entries {
+            let entry = entry.with_context(|| {
+                format!(
+                    "failed to read entry in archive directory {}",
+                    dir.display()
+                )
+            })?;
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("failed to inspect archive entry {}", path.display()))?;
+
+            if file_type.is_dir() {
+                if path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name == task_id)
+                    .unwrap_or(false)
+                {
+                    let candidate = path.join(format!("{task_id}.log"));
+                    if candidate.exists() {
+                        return Ok(Some(candidate));
+                    }
+                }
+                stack.push(path);
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn print_initial_log(reader: &mut BufReader<File>, limit: Option<usize>) -> Result<()> {
+    let mut buffer = String::new();
+    let mut stdout = io::stdout();
+
+    match limit {
+        Some(limit) => {
+            let mut lines = VecDeque::new();
+            loop {
+                buffer.clear();
+                let bytes = read_line_retry(reader, &mut buffer)
+                    .context("failed to read from log while preparing output")?;
+                if bytes == 0 {
+                    break;
+                }
+
+                if limit == 0 {
+                    continue;
+                }
+
+                if lines.len() == limit {
+                    lines.pop_front();
+                }
+                lines.push_back(buffer.clone());
+            }
+
+            for line in lines {
+                stdout
+                    .write_all(line.as_bytes())
+                    .context("failed to write log output")?;
+            }
+        }
+        None => loop {
+            buffer.clear();
+            let bytes = read_line_retry(reader, &mut buffer)
+                .context("failed to read from log while preparing output")?;
+            if bytes == 0 {
+                break;
+            }
+            stdout
+                .write_all(buffer.as_bytes())
+                .context("failed to write log output")?;
+        },
+    }
+
+    stdout
+        .flush()
+        .context("failed to flush log output to stdout")?;
+    Ok(())
+}
+
+fn follow_log(reader: &mut BufReader<File>) -> Result<()> {
+    let mut buffer = String::new();
+    let mut stdout = io::stdout();
+    loop {
+        buffer.clear();
+        match read_line_retry(reader, &mut buffer) {
+            Ok(0) => {
+                stdout
+                    .flush()
+                    .context("failed to flush log output to stdout")?;
+                thread::sleep(Duration::from_millis(250));
+            }
+            Ok(_) => {
+                stdout
+                    .write_all(buffer.as_bytes())
+                    .context("failed to write log output")?;
+                stdout
+                    .flush()
+                    .context("failed to flush log output to stdout")?;
+            }
+            Err(err) => {
+                return Err(err).context("failed to read from log while following");
+            }
+        }
+    }
+}
+
+fn read_line_retry<R: BufRead>(reader: &mut R, buffer: &mut String) -> io::Result<usize> {
+    loop {
+        match reader.read_line(buffer) {
+            Ok(bytes) => return Ok(bytes),
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 #[cfg(test)]

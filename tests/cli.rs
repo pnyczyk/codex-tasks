@@ -36,10 +36,10 @@ fn help_lists_supported_subcommands() {
 #[test]
 fn unfinished_subcommands_return_not_implemented_errors() {
     let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
-    cmd.args(["log", "task-xyz"]);
+    cmd.args(["archive", "task-xyz"]);
     cmd.assert()
         .failure()
-        .stderr(predicates::str::contains("`log` is not implemented yet"));
+        .stderr(predicates::str::contains("`archive` is not implemented yet"));
 }
 
 #[test]
@@ -532,4 +532,60 @@ fn status_detects_archived_tasks() {
     assert_eq!(value["location"], "archived");
     assert_eq!(value["pid"], Value::Null);
     assert_eq!(value["last_result"], "final outcome");
+}
+
+#[test]
+fn log_displays_entire_file() {
+    let home = tempdir().expect("tempdir");
+    let log_path = home
+        .path()
+        .join(".codex")
+        .join("tasks")
+        .join("task-123.log");
+    fs::create_dir_all(log_path.parent().expect("parent exists")).expect("create dirs");
+    fs::write(&log_path, b"line one\nline two\n").expect("write log");
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    cmd.env("HOME", home.path());
+    cmd.args(["log", "task-123"]);
+    cmd.assert().success().stdout("line one\nline two\n");
+}
+
+#[test]
+fn log_honors_tail_flag() {
+    let home = tempdir().expect("tempdir");
+    let log_path = home
+        .path()
+        .join(".codex")
+        .join("tasks")
+        .join("task-abc.log");
+    fs::create_dir_all(log_path.parent().expect("parent exists")).expect("create dirs");
+    fs::write(&log_path, b"keep\nlast\nline\n").expect("write log");
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    cmd.env("HOME", home.path());
+    cmd.args(["log", "-n", "1", "task-abc"]);
+    cmd.assert().success().stdout("line\n");
+}
+
+#[test]
+fn log_reads_archived_tasks() {
+    let home = tempdir().expect("tempdir");
+    let log_path = home
+        .path()
+        .join(".codex")
+        .join("tasks")
+        .join("done")
+        .join("2024")
+        .join("01")
+        .join("02")
+        .join("task-archived")
+        .join("task-archived.log");
+    fs::create_dir_all(log_path.parent().expect("parent exists")).expect("create dirs");
+    fs::write(&log_path, b"archived\ncontent\n").expect("write log");
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    cmd.env("HOME", home.path());
+    cmd.args(["log", "task-archived"]);
+    cmd.assert().success().stdout("archived\ncontent\n");
 }
