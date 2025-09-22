@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -9,7 +10,14 @@ use uuid::Uuid;
 
 use crate::task::{TaskId, TaskMetadata};
 
-const METADATA_EXTENSION: &str = "json";
+const ARCHIVE_DIR_NAME: &str = "archive";
+
+/// Canonical filenames for task artifacts stored on disk.
+pub const METADATA_FILE_NAME: &str = "task.json";
+pub const PID_FILE_NAME: &str = "task.pid";
+pub const PIPE_FILE_NAME: &str = "task.pipe";
+pub const LOG_FILE_NAME: &str = "task.log";
+pub const RESULT_FILE_NAME: &str = "task.result";
 
 /// Rooted view into the filesystem layout backing Codex tasks.
 #[derive(Clone, Debug)]
@@ -36,7 +44,7 @@ impl TaskStore {
 
     /// Directory containing archived tasks.
     pub fn archive_root(&self) -> PathBuf {
-        self.root.join("done")
+        self.root.join(ARCHIVE_DIR_NAME)
     }
 
     /// Ensures the primary directories required by the store exist.
@@ -88,14 +96,16 @@ impl TaskStore {
 
     /// Returns helpers for interacting with an active task's files.
     pub fn task(&self, task_id: impl Into<TaskId>) -> TaskPaths {
-        TaskPaths::new(self.root.clone(), task_id.into())
+        let id = task_id.into();
+        let directory = self.root.join(&id);
+        TaskPaths::from_directory(directory, id)
     }
 
     /// Returns helpers for interacting with an archived task's files.
     pub fn archived_task(&self, timestamp: DateTime<Utc>, task_id: impl Into<TaskId>) -> TaskPaths {
         let id = task_id.into();
         let dir = self.archive_bucket(timestamp).join(&id);
-        TaskPaths::new(dir, id)
+        TaskPaths::from_directory(dir, id)
     }
 
     /// Writes metadata to disk using the standard layout.
@@ -107,6 +117,48 @@ impl TaskStore {
     pub fn load_metadata(&self, task_id: impl Into<TaskId>) -> Result<TaskMetadata> {
         let id = task_id.into();
         self.task(id).read_metadata()
+    }
+
+    /// Attempts to locate an archived task by identifier, returning its paths and metadata.
+    pub fn find_archived_task(&self, task_id: &str) -> Result<Option<(TaskPaths, TaskMetadata)>> {
+        let archive_root = self.archive_root();
+        if !archive_root.exists() {
+            return Ok(None);
+        }
+
+        let mut queue = VecDeque::from([archive_root]);
+        while let Some(dir) = queue.pop_front() {
+            if dir
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name == task_id)
+            {
+                let paths = TaskPaths::from_directory(dir.clone(), task_id.to_string());
+                let metadata = paths.read_metadata()?;
+                return Ok(Some((paths, metadata)));
+            }
+
+            let entries = match fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("failed to read archive directory {}", dir.display())
+                    });
+                }
+            };
+
+            for entry in entries {
+                let entry = entry.with_context(|| {
+                    format!("failed to inspect archive entry in {}", dir.display())
+                })?;
+                if entry.file_type()?.is_dir() {
+                    queue.push_back(entry.path());
+                }
+            }
+        }
+
+        Ok(None)
     }
 }
 
@@ -122,6 +174,11 @@ impl TaskPaths {
         Self { base, task_id }
     }
 
+    /// Creates a helper for an existing task directory and identifier.
+    pub fn from_directory(directory: PathBuf, task_id: TaskId) -> Self {
+        Self::new(directory, task_id)
+    }
+
     /// Returns the identifier associated with these paths.
     pub fn id(&self) -> &str {
         &self.task_id
@@ -132,33 +189,33 @@ impl TaskPaths {
         &self.base
     }
 
-    fn file_path(&self, extension: &str) -> PathBuf {
-        self.base.join(format!("{}.{}", self.task_id, extension))
+    fn file_path(&self, file_name: &str) -> PathBuf {
+        self.base.join(file_name)
     }
 
     /// Location of the PID file for the task.
     pub fn pid_path(&self) -> PathBuf {
-        self.file_path("pid")
+        self.file_path(PID_FILE_NAME)
     }
 
     /// Location of the FIFO used for sending prompts to the worker.
     pub fn pipe_path(&self) -> PathBuf {
-        self.file_path("pipe")
+        self.file_path(PIPE_FILE_NAME)
     }
 
     /// Location where the worker writes the transcript log.
     pub fn log_path(&self) -> PathBuf {
-        self.file_path("log")
+        self.file_path(LOG_FILE_NAME)
     }
 
     /// Location that stores the most recent Codex result.
     pub fn result_path(&self) -> PathBuf {
-        self.file_path("result")
+        self.file_path(RESULT_FILE_NAME)
     }
 
     /// Location of the structured metadata file.
     pub fn metadata_path(&self) -> PathBuf {
-        self.file_path(METADATA_EXTENSION)
+        self.file_path(METADATA_FILE_NAME)
     }
 
     fn ensure_parent(&self, path: &Path) -> Result<()> {
@@ -383,6 +440,33 @@ mod tests {
             .join("02")
             .join("task-abc");
         assert_eq!(paths.directory(), expected_dir.as_path());
-        assert_eq!(paths.log_path(), expected_dir.join("task-abc.log"));
+        assert_eq!(paths.log_path(), expected_dir.join(LOG_FILE_NAME));
+    }
+
+    #[test]
+    fn find_archived_task_returns_metadata_and_paths() {
+        let tmp = tempdir().expect("tempdir");
+        let store = TaskStore::new(tmp.path().join("root"));
+        store.ensure_layout().expect("layout");
+        let timestamp = Utc
+            .with_ymd_and_hms(2024, 5, 6, 7, 8, 9)
+            .single()
+            .expect("timestamp");
+        let task_id = "task-find".to_string();
+        let archive_dir = store
+            .ensure_archive_task_dir(timestamp, &task_id)
+            .expect("archive dir");
+        let paths = TaskPaths::from_directory(archive_dir, task_id.clone());
+        let metadata = TaskMetadata::new(task_id.clone(), None, crate::task::TaskState::Stopped);
+        paths
+            .write_metadata(&metadata)
+            .expect("write archived metadata");
+
+        let found = store
+            .find_archived_task(&task_id)
+            .expect("find archived task")
+            .expect("task present");
+        assert_eq!(found.0.directory(), paths.directory());
+        assert_eq!(found.1, metadata);
     }
 }

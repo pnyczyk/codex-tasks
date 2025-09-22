@@ -51,17 +51,17 @@
    - **Depends on:** Tasks 2 & 4
 
 9. **Implement `ls` command**
-   - Enumerate `tasks/` and `tasks/done/**` directories.
+   - Enumerate `tasks/` and `tasks/archive/**` directories.
    - Aggregate metadata for each task; support `--state` filters.
    - **Depends on:** Task 2
 
 10. **Implement `log` command**
     - Tail/read `<task_id>.log` with options `-n`, `-f` (follow).
-    - Respect archived tasks (log location under `done/…`).
+    - Respect archived tasks (log location under `archive/…`).
     - **Depends on:** Task 2
 
 11. **Implement `archive` command**
-    - Move task files to dated `done/` subdirectory.
+    - Move task files to dated `archive/` subdirectory.
     - Prevent archiving RUNNING tasks without `stop`.
     - **Depends on:** Tasks 2, 8
 

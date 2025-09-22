@@ -9,14 +9,15 @@ const BIN: &str = "codex-tasks";
 fn worker_subcommand_writes_pid_file() {
     let tmp = tempdir().expect("tempdir");
     let task_id = "integration-worker";
-    let pid_path = tmp.path().join(format!("{task_id}.pid"));
+    let store_root = tmp.path().join(".codex").join("tasks");
+    let pid_path = store_root.join(task_id).join("task.pid");
 
     let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
     cmd.arg("worker")
         .arg("--task-id")
         .arg(task_id)
         .arg("--store-root")
-        .arg(tmp.path())
+        .arg(&store_root)
         .env("CODEX_TASKS_EXIT_AFTER_START", "1")
         .env("CODEX_TASK_TITLE", "Integration Title")
         .env("CODEX_TASK_PROMPT", "Integration Prompt");
