@@ -3,8 +3,14 @@ pub mod storage;
 pub mod task;
 pub mod worker;
 
-use anyhow::{Context, Result, bail};
+use std::fs::{File, OpenOptions};
+use std::io::{self, ErrorKind, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
+
+use anyhow::{bail, Context, Result};
 use clap::Parser;
+use libc::{ENXIO, O_NONBLOCK};
 
 use crate::cli::{
     ArchiveArgs, Cli, Command, LogArgs, LsArgs, SendArgs, StartArgs, StatusArgs, StopArgs,
@@ -12,7 +18,7 @@ use crate::cli::{
 };
 use crate::storage::TaskStore;
 use crate::task::{TaskMetadata, TaskState};
-use crate::worker::launcher::{WorkerLaunchRequest, spawn_worker};
+use crate::worker::launcher::{spawn_worker, WorkerLaunchRequest};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -60,8 +66,120 @@ fn handle_start(args: StartArgs) -> Result<()> {
     Ok(())
 }
 
-fn handle_send(_args: SendArgs) -> Result<()> {
-    not_implemented("send")
+fn handle_send(args: SendArgs) -> Result<()> {
+    let store = TaskStore::default().context("failed to locate task store")?;
+    let task_id = args.task_id;
+    let prompt = args.prompt;
+
+    let metadata = match store.load_metadata(task_id.clone()) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            if err
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io_err| io_err.kind() == ErrorKind::NotFound)
+            {
+                bail!("task {task_id} was not found");
+            }
+            return Err(err);
+        }
+    };
+
+    match metadata.state {
+        TaskState::Archived => {
+            bail!(
+                "task {} is ARCHIVED and cannot receive prompts",
+                metadata.id
+            )
+        }
+        TaskState::Stopped => {
+            bail!("task {} is STOPPED and cannot receive prompts", metadata.id)
+        }
+        TaskState::Died => {
+            bail!("task {} has DIED and cannot receive prompts", metadata.id)
+        }
+        TaskState::Idle | TaskState::Running => {}
+    }
+
+    let paths = store.task(task_id.clone());
+    let pipe_path = paths.pipe_path();
+    let mut pipe = match OpenOptions::new()
+        .write(true)
+        .custom_flags(O_NONBLOCK)
+        .open(&pipe_path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            bail!(missing_pipe_error(&metadata.id))
+        }
+        Err(err) if err.raw_os_error() == Some(ENXIO) => {
+            bail!(worker_inactive_error(&metadata.id))
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to open prompt pipe at {}", pipe_path.display()));
+        }
+    };
+
+    set_blocking(&pipe).with_context(|| {
+        format!(
+            "failed to configure prompt pipe at {} for blocking mode",
+            pipe_path.display()
+        )
+    })?;
+
+    let mut payload = prompt.into_bytes();
+    payload.push(b'\n');
+
+    if let Err(err) = pipe.write_all(&payload) {
+        if pipe_connection_lost(&err) {
+            bail!(worker_inactive_error(&metadata.id));
+        }
+        return Err(err)
+            .with_context(|| format!("failed to write prompt to {}", pipe_path.display()));
+    }
+
+    if let Err(err) = pipe.flush() {
+        if pipe_connection_lost(&err) {
+            bail!(worker_inactive_error(&metadata.id));
+        }
+        return Err(err)
+            .with_context(|| format!("failed to flush prompt pipe at {}", pipe_path.display()));
+    }
+
+    Ok(())
+}
+
+fn missing_pipe_error(task_id: &str) -> String {
+    format!(
+        "prompt pipe for task {task_id} is missing; the worker may have STOPPED, DIED, or been ARCHIVED"
+    )
+}
+
+fn worker_inactive_error(task_id: &str) -> String {
+    format!(
+        "task {task_id} is not accepting prompts; the worker may have STOPPED, DIED, or been ARCHIVED"
+    )
+}
+
+fn pipe_connection_lost(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+    )
+}
+
+fn set_blocking(file: &File) -> io::Result<()> {
+    let fd = file.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
 }
 
 fn handle_status(_args: StatusArgs) -> Result<()> {

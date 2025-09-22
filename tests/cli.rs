@@ -1,8 +1,16 @@
-use std::{fs, thread, time::Duration};
+use std::ffi::CString;
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use assert_cmd::Command;
+use chrono::Utc;
 use serde::Deserialize;
-use serde_json::from_str;
+use serde_json::{from_str, json};
 use tempfile::tempdir;
 use uuid::Uuid;
 
@@ -87,4 +95,168 @@ fn start_command_creates_task_and_launches_worker() {
     assert!(pid_path.exists(), "worker should record its pid");
     let pid_contents = fs::read_to_string(pid_path).expect("pid readable");
     assert!(!pid_contents.trim().is_empty(), "pid should not be empty");
+}
+
+#[test]
+fn send_returns_error_for_missing_task() {
+    let tmp = tempdir().expect("tempdir");
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    cmd.env("HOME", tmp.path())
+        .args(["send", "missing-task", "prompt"]);
+    cmd.assert()
+        .failure()
+        .stderr(predicates::str::contains("task missing-task was not found"));
+}
+
+#[test]
+fn send_rejects_stopped_tasks() {
+    let tmp = tempdir().expect("tempdir");
+    let tasks_dir = tmp.path().join(".codex").join("tasks");
+    fs::create_dir_all(&tasks_dir).expect("tasks dir");
+
+    let task_id = "stopped-task";
+    write_metadata(&tasks_dir, task_id, "STOPPED");
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    cmd.env("HOME", tmp.path())
+        .args(["send", task_id, "prompt"]);
+    cmd.assert().failure().stderr(predicates::str::contains(
+        "task stopped-task is STOPPED and cannot receive prompts",
+    ));
+}
+
+#[test]
+fn send_rejects_died_tasks() {
+    let tmp = tempdir().expect("tempdir");
+    let tasks_dir = tmp.path().join(".codex").join("tasks");
+    fs::create_dir_all(&tasks_dir).expect("tasks dir");
+
+    let task_id = "died-task";
+    write_metadata(&tasks_dir, task_id, "DIED");
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    cmd.env("HOME", tmp.path())
+        .args(["send", task_id, "prompt"]);
+    cmd.assert().failure().stderr(predicates::str::contains(
+        "task died-task has DIED and cannot receive prompts",
+    ));
+}
+
+#[test]
+fn send_rejects_archived_tasks() {
+    let tmp = tempdir().expect("tempdir");
+    let tasks_dir = tmp.path().join(".codex").join("tasks");
+    fs::create_dir_all(&tasks_dir).expect("tasks dir");
+
+    let task_id = "archived-task";
+    write_metadata(&tasks_dir, task_id, "ARCHIVED");
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    cmd.env("HOME", tmp.path())
+        .args(["send", task_id, "prompt"]);
+    cmd.assert().failure().stderr(predicates::str::contains(
+        "task archived-task is ARCHIVED and cannot receive prompts",
+    ));
+}
+
+#[test]
+fn send_writes_prompt_to_pipe() {
+    let tmp = tempdir().expect("tempdir");
+    let tasks_dir = tmp.path().join(".codex").join("tasks");
+    fs::create_dir_all(&tasks_dir).expect("tasks dir");
+
+    let task_id = "active-task";
+    write_metadata(&tasks_dir, task_id, "IDLE");
+    let pipe_path = tasks_dir.join(format!("{task_id}.pipe"));
+    create_pipe(&pipe_path);
+
+    let (tx, rx) = mpsc::channel();
+    let reader_path = pipe_path.clone();
+    let reader = thread::spawn(move || {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .open(&reader_path)
+            .expect("open pipe for read");
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read line");
+        tx.send(line).expect("send line");
+    });
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    cmd.env("HOME", tmp.path())
+        .args(["send", task_id, "hello world"]);
+    cmd.assert().success();
+
+    let line = rx.recv().expect("prompt from pipe");
+    reader.join().expect("reader thread");
+    assert_eq!(line, "hello world\n");
+}
+
+#[test]
+fn send_errors_when_pipe_missing() {
+    let tmp = tempdir().expect("tempdir");
+    let tasks_dir = tmp.path().join(".codex").join("tasks");
+    fs::create_dir_all(&tasks_dir).expect("tasks dir");
+
+    let task_id = "missing-pipe-task";
+    write_metadata(&tasks_dir, task_id, "IDLE");
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    cmd.env("HOME", tmp.path())
+        .args(["send", task_id, "prompt"]);
+    cmd.assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "prompt pipe for task missing-pipe-task is missing; the worker may have STOPPED, DIED, or been ARCHIVED",
+        ));
+}
+
+#[test]
+fn send_errors_when_pipe_has_no_reader() {
+    let tmp = tempdir().expect("tempdir");
+    let tasks_dir = tmp.path().join(".codex").join("tasks");
+    fs::create_dir_all(&tasks_dir).expect("tasks dir");
+
+    let task_id = "no-reader-task";
+    write_metadata(&tasks_dir, task_id, "IDLE");
+    let pipe_path = tasks_dir.join(format!("{task_id}.pipe"));
+    create_pipe(&pipe_path);
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    cmd.env("HOME", tmp.path())
+        .args(["send", task_id, "prompt"]);
+    cmd.assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "task no-reader-task is not accepting prompts; the worker may have STOPPED, DIED, or been ARCHIVED",
+        ));
+}
+
+fn write_metadata(tasks_dir: &Path, task_id: &str, state: &str) {
+    let metadata_path = tasks_dir.join(format!("{task_id}.json"));
+    let timestamp = Utc::now().to_rfc3339();
+    let payload = json!({
+        "id": task_id,
+        "state": state,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+    });
+    fs::write(
+        metadata_path,
+        serde_json::to_string_pretty(&payload).expect("serialize metadata"),
+    )
+    .expect("write metadata");
+}
+
+fn create_pipe(path: &Path) {
+    if path.exists() {
+        fs::remove_file(path).expect("remove existing pipe");
+    }
+    let c_path = CString::new(path.as_os_str().as_bytes()).expect("pipe path");
+    let mode = 0o600;
+    let result = unsafe { libc::mkfifo(c_path.as_ptr(), mode) };
+    if result != 0 {
+        panic!("failed to create pipe: {}", std::io::Error::last_os_error());
+    }
 }
