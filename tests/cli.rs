@@ -3,6 +3,7 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::process::Command as StdCommand;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -10,8 +11,8 @@ use std::time::Duration;
 use assert_cmd::Command;
 use chrono::Utc;
 use serde::Deserialize;
-use serde_json::{from_str, json};
-use tempfile::tempdir;
+use serde_json::{from_str, json, Value};
+use tempfile::{tempdir, TempDir};
 use uuid::Uuid;
 
 const BIN: &str = "codex-tasks";
@@ -38,12 +39,6 @@ fn unfinished_subcommands_return_not_implemented_errors() {
     cmd.assert()
         .failure()
         .stderr(predicates::str::contains("`ls` is not implemented yet"));
-
-    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
-    cmd.args(["status", "fake-task"]);
-    cmd.assert()
-        .failure()
-        .stderr(predicates::str::contains("`status` is not implemented yet"));
 }
 
 #[test]
@@ -259,4 +254,145 @@ fn create_pipe(path: &Path) {
     if result != 0 {
         panic!("failed to create pipe: {}", std::io::Error::last_os_error());
     }
+}
+
+#[test]
+fn status_reports_idle_task_in_json() {
+    let temp = TempDir::new().expect("temp dir");
+    let home = temp.path();
+    let task_id = "task-123";
+    let created_at = "2024-05-01T12:34:56Z";
+    let store_root = home.join(".codex").join("tasks");
+    fs::create_dir_all(&store_root).expect("store root");
+    let metadata = serde_json::json!({
+        "id": task_id,
+        "title": "Example task",
+        "state": "IDLE",
+        "created_at": created_at,
+        "updated_at": created_at
+    });
+    fs::write(
+        store_root.join(format!("{task_id}.json")),
+        serde_json::to_string_pretty(&metadata).unwrap(),
+    )
+    .expect("metadata");
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    cmd.env("HOME", home).args(["status", "--json", task_id]);
+    let output = cmd.assert().success().get_output().stdout.clone();
+    let value: Value = serde_json::from_slice(&output).expect("valid json");
+    assert_eq!(value["id"], task_id);
+    assert_eq!(value["title"], "Example task");
+    assert_eq!(value["state"], "IDLE");
+    assert_eq!(value["location"], "active");
+    assert_eq!(value["pid"], Value::Null);
+}
+
+#[test]
+fn status_flags_missing_pid_as_died() {
+    let temp = TempDir::new().expect("temp dir");
+    let home = temp.path();
+    let task_id = "task-456";
+    let timestamp = "2024-05-02T00:00:00Z";
+    let store_root = home.join(".codex").join("tasks");
+    fs::create_dir_all(&store_root).expect("store root");
+    let metadata = serde_json::json!({
+        "id": task_id,
+        "state": "RUNNING",
+        "created_at": timestamp,
+        "updated_at": timestamp
+    });
+    fs::write(
+        store_root.join(format!("{task_id}.json")),
+        serde_json::to_string_pretty(&metadata).unwrap(),
+    )
+    .expect("metadata");
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    cmd.env("HOME", home).args(["status", "--json", task_id]);
+    let output = cmd.assert().success().get_output().stdout.clone();
+    let value: Value = serde_json::from_slice(&output).expect("valid json");
+    assert_eq!(value["state"], "DIED");
+    assert_eq!(value["location"], "active");
+    assert_eq!(value["pid"], Value::Null);
+}
+
+#[test]
+fn status_reports_running_task_when_pid_alive() {
+    let temp = TempDir::new().expect("temp dir");
+    let home = temp.path();
+    let task_id = "task-789";
+    let timestamp = "2024-05-03T06:07:08Z";
+    let store_root = home.join(".codex").join("tasks");
+    fs::create_dir_all(&store_root).expect("store root");
+    let metadata = serde_json::json!({
+        "id": task_id,
+        "state": "RUNNING",
+        "created_at": timestamp,
+        "updated_at": timestamp
+    });
+    fs::write(
+        store_root.join(format!("{task_id}.json")),
+        serde_json::to_string_pretty(&metadata).unwrap(),
+    )
+    .expect("metadata");
+
+    let mut child = StdCommand::new("sleep")
+        .arg("5")
+        .spawn()
+        .expect("spawn sleep");
+    let pid = i32::try_from(child.id()).expect("pid fits in i32");
+    fs::write(store_root.join(format!("{task_id}.pid")), pid.to_string()).expect("pid file");
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    cmd.env("HOME", home).args(["status", "--json", task_id]);
+    let output = cmd.assert().success().get_output().stdout.clone();
+    let value: Value = serde_json::from_slice(&output).expect("valid json");
+    assert_eq!(value["state"], "RUNNING");
+    assert_eq!(value["pid"], pid);
+    assert_eq!(value["location"], "active");
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn status_detects_archived_tasks() {
+    let temp = TempDir::new().expect("temp dir");
+    let home = temp.path();
+    let task_id = "task-archived";
+    let timestamp = "2024-05-04T09:10:11Z";
+    let store_root = home.join(".codex").join("tasks");
+    let archive_dir = store_root
+        .join("done")
+        .join("2024")
+        .join("05")
+        .join("04")
+        .join(task_id);
+    fs::create_dir_all(&archive_dir).expect("archive dir");
+    let metadata = serde_json::json!({
+        "id": task_id,
+        "state": "ARCHIVED",
+        "created_at": timestamp,
+        "updated_at": timestamp
+    });
+    fs::write(
+        archive_dir.join(format!("{task_id}.json")),
+        serde_json::to_string_pretty(&metadata).unwrap(),
+    )
+    .expect("metadata");
+    fs::write(
+        archive_dir.join(format!("{task_id}.result")),
+        "final outcome",
+    )
+    .expect("result");
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    cmd.env("HOME", home).args(["status", "--json", task_id]);
+    let output = cmd.assert().success().get_output().stdout.clone();
+    let value: Value = serde_json::from_slice(&output).expect("valid json");
+    assert_eq!(value["state"], "ARCHIVED");
+    assert_eq!(value["location"], "archived");
+    assert_eq!(value["pid"], Value::Null);
+    assert_eq!(value["last_result"], "final outcome");
 }

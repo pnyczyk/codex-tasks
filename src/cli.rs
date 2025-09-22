@@ -63,6 +63,9 @@ pub struct SendArgs {
 /// Arguments for the `status` subcommand.
 #[derive(Debug, Args)]
 pub struct StatusArgs {
+    /// Emit machine-readable JSON output.
+    #[arg(long)]
+    pub json: bool,
     /// Identifier of the task that should be inspected.
     pub task_id: String,
 }
