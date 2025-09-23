@@ -130,10 +130,10 @@ This PRD captures the requirements, user journeys, constraints, and open questio
 - Lead time to onboard a new provider CLI measured in days rather than weeks once adapters are in place.
 
 ## 14. Documentation updates
-- Update `README.md` and `docs/prd.md` to reference the new capability once implemented.
+- Update `README.md` and `docs/01-mvp/prd.md` to reference the new capability once implemented.
 - Add troubleshooting sections covering common container errors, provider misconfiguration, and workarounds.
 
 ## 15. Appendices
-- **References**: Docker CLI docs (v26, September 2025), Podman 5.x docs, provider CLI docs (Codex, Claude Code, Gemini), existing `docs/prd.md` future enhancements list.
+- **References**: Docker CLI docs (v26, September 2025), Podman 5.x docs, provider CLI docs (Codex, Claude Code, Gemini), existing `docs/01-mvp/prd.md` future enhancements list.
 - **Glossary**: Container runtime, provider adapter, bind mount, image, preset.
 

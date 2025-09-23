@@ -60,8 +60,9 @@ codex-tasks archive "$TASK_ID"
 ```
 
 ## Additional documentation
-- [Product requirements](docs/prd.md)
-- [Implementation plan](docs/plan.md)
+- [Product requirements](docs/01-mvp/prd.md)
+- [Implementation plan](docs/01-mvp/plan.prd)
+- [Containerized/provider workers PRD](docs/02-containers/prd-containerized-workers.md)
 - [Codex protocol reference](docs/proto.md)
 
 These documents describe the broader architecture, development roadmap, and wire protocol used by the worker process.
