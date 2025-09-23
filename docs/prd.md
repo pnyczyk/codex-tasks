@@ -118,5 +118,9 @@ archive → ARCHIVED (files moved to archive/…)
 ## 10. Future enhancements (out of scope for initial version)
 - Optional metadata cache (`meta.json`) to avoid scanning directories on `ls`.
 - Structured JSON output for `status` / `ls`.
-- Built-in tailing (`codex-tasks logs <id>`).
+- Configuration customization templates for workers:
+  - Start worker in another directory
+  - Worker in containers, i.e. Docker
+  - Worker initialization scripts, i.e. repo cloning, dependencies installation
+  - Secrets management
 - Integration hooks for external orchestrators.
