@@ -1,11 +1,12 @@
 use std::collections::VecDeque;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Datelike, Utc};
 use dirs::home_dir;
+use tempfile::NamedTempFile;
 use uuid::Uuid;
 
 use crate::task::{TaskId, TaskMetadata};
@@ -236,10 +237,21 @@ impl TaskPaths {
         );
         let path = self.metadata_path();
         self.ensure_parent(&path)?;
-        let payload = serde_json::to_string_pretty(metadata)
+        let payload = serde_json::to_vec_pretty(metadata)
             .with_context(|| format!("failed to serialize metadata for task {}", self.task_id))?;
-        fs::write(&path, payload)
+        let parent = path
+            .parent()
+            .context("metadata path missing parent directory")?;
+        let mut temp = NamedTempFile::new_in(parent)
+            .with_context(|| format!("failed to create temp file for task {}", self.task_id))?;
+        temp.write_all(&payload)
             .with_context(|| format!("failed to write metadata for task {}", self.task_id))?;
+        temp.as_file()
+            .sync_all()
+            .with_context(|| format!("failed to sync metadata for task {}", self.task_id))?;
+        temp.persist(&path)
+            .map_err(|err| err.error)
+            .with_context(|| format!("failed to persist metadata for task {}", self.task_id))?;
         Ok(())
     }
 
