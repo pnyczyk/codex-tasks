@@ -9,7 +9,7 @@ The `main` branch now enforces branch protection to keep production-ready code s
 - **Pull requests only** – at least one approving review is required before merging.
 - **Status checks** – the GitHub Actions job `test` must pass on the latest commit.
 - **Strict updates** – branches must be up to date with `main` before merge.
-- **Admin enforcement** – administrators must also respect the rules.
+- **Admin bypass** – repository administrators (owner) can merge without an extra reviewer.
 - **No force pushes or deletions** – direct history rewrites are blocked.
 - **Linear history & conversations** – rebases (no merge commits) are required and all review threads must be resolved.
 
