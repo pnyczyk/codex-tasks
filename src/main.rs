@@ -143,7 +143,8 @@ fn prepare_working_directory(
             None
         };
         let repo_spec: &OsStr = repo_spec_storage
-            .as_deref()
+            .as_ref()
+            .map(|value| value.as_os_str())
             .unwrap_or_else(|| OsStr::new(repo_url));
         let target = resolved
             .as_ref()
@@ -413,8 +414,15 @@ fn handle_log(args: LogArgs) -> Result<()> {
     })?;
     let mut reader = BufReader::new(file);
     print_initial_log(&mut reader, args.lines)?;
-    if args.follow {
-        follow_log(&mut reader)?;
+    let should_follow = args.follow || args.forever;
+    if should_follow {
+        let metadata = resolve_follow_metadata(&store, &args.task_id)?;
+        let context = FollowContext {
+            task_id: args.task_id,
+            metadata,
+            forever: args.forever,
+        };
+        follow_log(&mut reader, context)?;
     }
     Ok(())
 }
@@ -916,9 +924,11 @@ fn print_initial_log(reader: &mut BufReader<File>, limit: Option<usize>) -> Resu
     Ok(())
 }
 
-fn follow_log(reader: &mut BufReader<File>) -> Result<()> {
+fn follow_log(reader: &mut BufReader<File>, context: FollowContext) -> Result<()> {
     let mut buffer = String::new();
     let mut stdout = io::stdout();
+    let mut idle_pending = false;
+
     loop {
         buffer.clear();
         match read_line_retry(reader, &mut buffer) {
@@ -926,9 +936,50 @@ fn follow_log(reader: &mut BufReader<File>) -> Result<()> {
                 stdout
                     .flush()
                     .context("failed to flush log output to stdout")?;
+
+                if context.forever {
+                    thread::sleep(Duration::from_millis(250));
+                    continue;
+                }
+
+                match context.current_state() {
+                    Ok(Some(TaskState::Idle)) => {
+                        if idle_pending {
+                            eprintln!("Task {} is IDLE; stopping log follow.", context.task_id);
+                            break;
+                        }
+                        idle_pending = true;
+                    }
+                    Ok(Some(
+                        state @ (TaskState::Stopped | TaskState::Died | TaskState::Archived),
+                    )) => {
+                        eprintln!(
+                            "Task {} is {}; stopping log follow.",
+                            context.task_id,
+                            state.as_str()
+                        );
+                        break;
+                    }
+                    Ok(Some(TaskState::Running)) => {
+                        idle_pending = false;
+                    }
+                    Ok(None) => {
+                        eprintln!(
+                            "Task {} state unavailable; stopping log follow.",
+                            context.task_id
+                        );
+                        break;
+                    }
+                    Err(err) => {
+                        eprintln!("Failed to read state for task {}: {err:#}", context.task_id);
+                        break;
+                    }
+                }
+
                 thread::sleep(Duration::from_millis(250));
             }
             Ok(_) => {
+                idle_pending = false;
                 stdout
                     .write_all(buffer.as_bytes())
                     .context("failed to write log output")?;
@@ -941,6 +992,60 @@ fn follow_log(reader: &mut BufReader<File>) -> Result<()> {
             }
         }
     }
+
+    Ok(())
+}
+
+#[derive(Clone)]
+enum FollowMetadata {
+    Active { store: TaskStore },
+    Archived { state: TaskState },
+    Missing,
+}
+
+struct FollowContext {
+    task_id: String,
+    metadata: FollowMetadata,
+    forever: bool,
+}
+
+impl FollowContext {
+    fn current_state(&self) -> Result<Option<TaskState>> {
+        match &self.metadata {
+            FollowMetadata::Active { store } => match store.load_metadata(self.task_id.clone()) {
+                Ok(metadata) => Ok(Some(metadata.state)),
+                Err(err) => {
+                    if err
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io_err| io_err.kind() == ErrorKind::NotFound)
+                    {
+                        Ok(None)
+                    } else {
+                        Err(err)
+                    }
+                }
+            },
+            FollowMetadata::Archived { state } => Ok(Some(state.clone())),
+            FollowMetadata::Missing => Ok(None),
+        }
+    }
+}
+
+fn resolve_follow_metadata(store: &TaskStore, task_id: &str) -> Result<FollowMetadata> {
+    let active_metadata_path = store.task(task_id.to_string()).metadata_path();
+    if active_metadata_path.exists() {
+        return Ok(FollowMetadata::Active {
+            store: store.clone(),
+        });
+    }
+
+    if let Some((_, metadata)) = store.find_archived_task(task_id)? {
+        return Ok(FollowMetadata::Archived {
+            state: metadata.state,
+        });
+    }
+
+    Ok(FollowMetadata::Missing)
 }
 
 fn read_line_retry<R: BufRead>(reader: &mut R, buffer: &mut String) -> io::Result<usize> {

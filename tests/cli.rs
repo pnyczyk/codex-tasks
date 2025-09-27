@@ -6,12 +6,13 @@ use std::io::{BufRead, BufReader};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command as StdCommand;
+use std::process::{Command as StdCommand, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
+use assert_cmd::cargo::cargo_bin;
 use chrono::{TimeZone, Utc};
 use predicates::prelude::PredicateBooleanExt;
 use serde::Deserialize;
@@ -1295,4 +1296,114 @@ fn log_reads_archived_tasks() {
     cmd.env("HOME", home.path());
     cmd.args(["log", "task-archived"]);
     cmd.assert().success().stdout("archived\ncontent\n");
+}
+
+#[test]
+fn log_follow_exits_when_task_idle() {
+    let home = tempdir().expect("tempdir");
+    let task_dir = home.path().join(".codex").join("tasks").join("task-idle");
+    fs::create_dir_all(&task_dir).expect("create dirs");
+    let log_path = task_dir.join("task.log");
+    fs::write(&log_path, b"first line\nsecond line\n").expect("write log");
+    write_metadata(
+        &home.path().join(".codex").join("tasks"),
+        "task-idle",
+        "IDLE",
+    );
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    let assert = cmd
+        .env("HOME", home.path())
+        .args(["log", "-f", "task-idle"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    assert_eq!(stdout, "first line\nsecond line\n");
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).expect("stderr utf8");
+    assert!(
+        stderr.contains("IDLE"),
+        "expected stderr to mention idle completion, got: {stderr}"
+    );
+}
+
+#[test]
+fn log_follow_exits_for_archived_tasks() {
+    let home = tempdir().expect("tempdir");
+    let log_path = home
+        .path()
+        .join(".codex")
+        .join("tasks")
+        .join("archive")
+        .join("2024")
+        .join("01")
+        .join("02")
+        .join("task-archived")
+        .join("task.log");
+    fs::create_dir_all(log_path.parent().expect("parent exists")).expect("create dirs");
+    fs::write(&log_path, b"archived\ncontent\n").expect("write log");
+    let metadata_path = log_path.parent().expect("parent").join("task.json");
+    fs::write(
+        &metadata_path,
+        serde_json::to_string_pretty(&json!({
+            "id": "task-archived",
+            "state": "ARCHIVED",
+            "created_at": "2024-01-02T03:04:05Z",
+            "updated_at": "2024-01-02T03:04:05Z"
+        }))
+        .expect("metadata"),
+    )
+    .expect("write metadata");
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    let assert = cmd
+        .env("HOME", home.path())
+        .args(["log", "-f", "task-archived"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    assert_eq!(stdout, "archived\ncontent\n");
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).expect("stderr utf8");
+    assert!(
+        stderr.contains("ARCHIVED"),
+        "expected stderr to mention archived completion, got: {stderr}"
+    );
+}
+
+#[test]
+fn log_forever_flag_waits_for_manual_interrupt() {
+    let home = tempdir().expect("tempdir");
+    let task_dir = home
+        .path()
+        .join(".codex")
+        .join("tasks")
+        .join("task-forever");
+    fs::create_dir_all(&task_dir).expect("create dirs");
+    let log_path = task_dir.join("task.log");
+    fs::write(&log_path, b"initial\n").expect("write log");
+    write_metadata(
+        &home.path().join(".codex").join("tasks"),
+        "task-forever",
+        "IDLE",
+    );
+
+    let binary = cargo_bin(BIN);
+    let mut child = StdCommand::new(binary)
+        .env("HOME", home.path())
+        .args(["log", "--forever", "task-forever"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn log --forever");
+
+    thread::sleep(Duration::from_millis(300));
+    let still_running = child.try_wait().expect("query status").is_none();
+    assert!(
+        still_running,
+        "log --forever should continue running until interrupted"
+    );
+
+    child.kill().expect("kill log --forever");
+    let _ = child.wait();
 }

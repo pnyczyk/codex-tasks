@@ -43,7 +43,8 @@ codex-tasks archive <task_id>
 
 ### 3.4 `log`
 - Stream the rendered transcript from `<task_id>.log`.
-- `-f/--follow` behaves like `tail -f`, continuing to stream new lines until interrupted.
+- `-f/--follow` streams until the worker returns to `IDLE` (or reaches a terminal state), exiting automatically afterwards.
+- `--forever`/`-F` implies `--follow` and retains the original "tail indefinitely" behavior for users who want to keep the stream open.
 - `-n/--lines <N>` restricts the initial dump to the last *N* lines before optionally following.
 - Intended as the primary observability tool without attaching a TTY to the worker.
 
