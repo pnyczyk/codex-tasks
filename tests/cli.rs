@@ -797,6 +797,53 @@ fn archive_rejects_running_task() {
 }
 
 #[test]
+fn archive_all_archives_stopped_and_died_tasks() {
+    let tmp = tempdir().expect("tempdir");
+    let home = tmp.path();
+    let tasks_dir = home.join(".codex").join("tasks");
+    fs::create_dir_all(&tasks_dir).expect("tasks dir");
+
+    write_metadata(&tasks_dir, "task-stopped", "STOPPED");
+    fs::write(
+        tasks_dir.join("task-stopped").join("task.result"),
+        "stopped result",
+    )
+    .expect("write result");
+
+    write_metadata(&tasks_dir, "task-died", "DIED");
+
+    write_metadata(&tasks_dir, "task-running", "RUNNING");
+    let run_pid = i32::try_from(std::process::id()).expect("pid fits");
+    fs::write(
+        tasks_dir.join("task-running").join("task.pid"),
+        run_pid.to_string(),
+    )
+    .expect("write pid");
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    let assert = cmd
+        .env("HOME", home)
+        .args(["archive", "-a"])
+        .assert()
+        .success();
+
+    let output = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    assert!(output.contains("Task task-stopped archived"));
+    assert!(output.contains("Task task-died archived"));
+    assert!(output.contains("Skipping task task-running"));
+
+    let archive_root = tasks_dir.join("archive");
+    let stopped_dir = find_task_directory(&archive_root, "task-stopped").expect("stopped dir");
+    assert!(stopped_dir.join("task.json").exists());
+    let died_dir = find_task_directory(&archive_root, "task-died").expect("died dir");
+    assert!(died_dir.join("task.json").exists());
+
+    assert!(tasks_dir.join("task-running").exists());
+    assert!(!tasks_dir.join("task-stopped").exists());
+    assert!(!tasks_dir.join("task-died").exists());
+}
+
+#[test]
 fn end_to_end_task_lifecycle_flow() {
     let env = IntegrationTestEnv::new();
 
