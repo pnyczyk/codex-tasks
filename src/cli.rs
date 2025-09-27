@@ -127,8 +127,12 @@ pub struct LsArgs {
 /// Arguments for the `archive` subcommand.
 #[derive(Debug, Args)]
 pub struct ArchiveArgs {
+    /// Archive every STOPPED or DIED task.
+    #[arg(short = 'a', long = "all", conflicts_with = "task_id")]
+    pub all: bool,
     /// Identifier of the task that should be archived.
-    pub task_id: String,
+    #[arg(value_name = "TASK_ID", required_unless_present = "all")]
+    pub task_id: Option<String>,
 }
 
 /// Hidden arguments used when the CLI binary is re-executed as a worker.
