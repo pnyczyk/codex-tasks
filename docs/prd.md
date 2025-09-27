@@ -58,8 +58,9 @@ codex-tasks archive <task_id>
 - Optional `--state` filters (multiple allowed via repeated flags or comma-delimited values).
 
 ### 3.7 `archive`
-- Move task files into `archive/<YYYY>/<MM>/<DD>/<task_id>/`.
-- Status becomes `ARCHIVED`.
+- `archive <task_id>` moves the specified task into `archive/<YYYY>/<MM>/<DD>/<task_id>/` and marks it `ARCHIVED`.
+- `archive -a/--all` iterates over all tasks, archiving those whose state is `STOPPED` or `DIED` and skipping others.
+- Status becomes `ARCHIVED` for each archived task.
 
 ## 4. Task data model
 - `task_id`: UUID (e.g., `7df7c873-...`).

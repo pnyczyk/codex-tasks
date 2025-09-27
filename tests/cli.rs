@@ -68,6 +68,23 @@ fn init_repo_with_feature_branch(path: &Path) {
     git_commit(path, "feature commit");
 }
 
+fn find_unused_pid() -> i32 {
+    let mut candidate: i32 = 100_000;
+    while candidate < 1_000_000 {
+        let result = unsafe { libc::kill(candidate, 0) };
+        if result == -1 {
+            match std::io::Error::last_os_error().raw_os_error() {
+                Some(code) if code == libc::ESRCH || code == libc::EINVAL => {
+                    return candidate;
+                }
+                _ => {}
+            }
+        }
+        candidate += 1;
+    }
+    panic!("failed to find unused pid for tests");
+}
+
 #[test]
 fn help_lists_supported_subcommands() {
     let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
@@ -718,7 +735,8 @@ fn archive_moves_task_into_archive() {
     .expect("write metadata");
     fs::write(task_dir.join("task.log"), "log contents").expect("log");
     fs::write(task_dir.join("task.result"), "final result").expect("result");
-    fs::write(task_dir.join("task.pid"), "1234").expect("pid");
+    let pid = find_unused_pid();
+    fs::write(task_dir.join("task.pid"), pid.to_string()).expect("pid");
     create_pipe(task_dir.join("task.pipe").as_path());
 
     let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
@@ -794,6 +812,53 @@ fn archive_rejects_running_task() {
         .stderr(predicates::str::contains(
             "task task-running is RUNNING; stop it before archiving",
         ));
+}
+
+#[test]
+fn archive_all_archives_stopped_and_died_tasks() {
+    let tmp = tempdir().expect("tempdir");
+    let home = tmp.path();
+    let tasks_dir = home.join(".codex").join("tasks");
+    fs::create_dir_all(&tasks_dir).expect("tasks dir");
+
+    write_metadata(&tasks_dir, "task-stopped", "STOPPED");
+    fs::write(
+        tasks_dir.join("task-stopped").join("task.result"),
+        "stopped result",
+    )
+    .expect("write result");
+
+    write_metadata(&tasks_dir, "task-died", "DIED");
+
+    write_metadata(&tasks_dir, "task-running", "RUNNING");
+    let run_pid = i32::try_from(std::process::id()).expect("pid fits");
+    fs::write(
+        tasks_dir.join("task-running").join("task.pid"),
+        run_pid.to_string(),
+    )
+    .expect("write pid");
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    let assert = cmd
+        .env("HOME", home)
+        .args(["archive", "-a"])
+        .assert()
+        .success();
+
+    let output = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    assert!(output.contains("Task task-stopped archived"));
+    assert!(output.contains("Task task-died archived"));
+    assert!(output.contains("Skipping task task-running"));
+
+    let archive_root = tasks_dir.join("archive");
+    let stopped_dir = find_task_directory(&archive_root, "task-stopped").expect("stopped dir");
+    assert!(stopped_dir.join("task.json").exists());
+    let died_dir = find_task_directory(&archive_root, "task-died").expect("died dir");
+    assert!(died_dir.join("task.json").exists());
+
+    assert!(tasks_dir.join("task-running").exists());
+    assert!(!tasks_dir.join("task-stopped").exists());
+    assert!(!tasks_dir.join("task-died").exists());
 }
 
 #[test]
