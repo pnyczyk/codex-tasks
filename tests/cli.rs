@@ -68,6 +68,23 @@ fn init_repo_with_feature_branch(path: &Path) {
     git_commit(path, "feature commit");
 }
 
+fn find_unused_pid() -> i32 {
+    let mut candidate: i32 = 100_000;
+    while candidate < 1_000_000 {
+        let result = unsafe { libc::kill(candidate, 0) };
+        if result == -1 {
+            match std::io::Error::last_os_error().raw_os_error() {
+                Some(code) if code == libc::ESRCH || code == libc::EINVAL => {
+                    return candidate;
+                }
+                _ => {}
+            }
+        }
+        candidate += 1;
+    }
+    panic!("failed to find unused pid for tests");
+}
+
 #[test]
 fn help_lists_supported_subcommands() {
     let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
@@ -718,7 +735,8 @@ fn archive_moves_task_into_archive() {
     .expect("write metadata");
     fs::write(task_dir.join("task.log"), "log contents").expect("log");
     fs::write(task_dir.join("task.result"), "final result").expect("result");
-    fs::write(task_dir.join("task.pid"), "1234").expect("pid");
+    let pid = find_unused_pid();
+    fs::write(task_dir.join("task.pid"), pid.to_string()).expect("pid");
     create_pipe(task_dir.join("task.pipe").as_path());
 
     let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
