@@ -88,6 +88,9 @@ pub struct LogArgs {
     /// Follow the log output until interrupted.
     #[arg(short = 'f', long)]
     pub follow: bool,
+    /// Continue following even after the worker becomes idle.
+    #[arg(short = 'F', long = "forever")]
+    pub forever: bool,
     /// Only print the last N lines before optionally following.
     #[arg(short = 'n', long)]
     pub lines: Option<usize>,

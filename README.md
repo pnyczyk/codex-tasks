@@ -35,7 +35,7 @@ The CLI exposes several subcommands; run `codex-tasks <command> --help` for full
 | `codex-tasks start [-t <title>] [prompt]` | Create a new task, optionally sending an initial prompt. |
 | `codex-tasks send <task_id> <prompt>` | Send another prompt to an existing task. |
 | `codex-tasks status [--json] <task_id>` | Show live status, metadata, and the last prompt/result. |
-| `codex-tasks log [-f] [-n <lines>] <task_id>` | Stream or tail the transcript for a task. |
+| `codex-tasks log [-f\|--follow] [--forever] [-n <lines>] <task_id>` | Stream or tail the transcript for a task. |
 | `codex-tasks stop <task_id>` | Gracefully shut down the worker process. |
 | `codex-tasks ls [-a\|--all] [--state <STATE> ...]` | List active tasks, optionally including archived ones and filtering by state. |
 | `codex-tasks archive <task_id>` | Move task files into the archive hierarchy after completion. |
@@ -45,6 +45,8 @@ The `start` subcommand accepts additional flags for tailoring the worker environ
 - `--working-dir DIR` runs `codex proto` inside the specified directory, creating it when needed.
 - `--repo URL` clones a Git repository into the working directory before launching the worker (requires `--working-dir`).
 - `--repo-ref REF` checks out the given branch, tag, or commit after cloning the repository.
+
+The `log -f/--follow` flag now exits automatically once the worker returns to `IDLE`, `STOPPED`, or `DIED`. Use `--forever` (or `-F`) to retain the original "follow until interrupted" behavior.
 
 ### Typical workflow
 ```bash
