@@ -11,7 +11,7 @@
 
 ## 3. CLI surface
 ```
-codex-tasks start [-t <title>] [prompt]
+codex-tasks start [-t <title>] [--config-file <PATH>] [--working-dir <DIR>] [--repo <URL>] [--repo-ref <REF>] [prompt]
 codex-tasks send <task_id> <prompt>
 codex-tasks status <task_id>
 codex-tasks log [-f] [-n <lines>] <task_id>
@@ -25,6 +25,11 @@ codex-tasks archive <task_id>
 - Fork a helper process (the “task worker”).
   - Worker launches `codex proto`, reusing the current `codex-task` I/O pipeline.
   - If an initial prompt is provided, send it immediately.
+- Optional inputs that tailor worker launch:
+  - `--config-file PATH`: load a custom `config.toml` for Codex with the path’s parent treated as `CODEX_HOME`.
+  - `--working-dir DIR`: run `codex proto` from this directory (created if missing, unless repo cloning is requested).
+  - `--repo URL`: clone the Git repository into the parent of `DIR` and use the directory name as the clone target (requires `--working-dir`).
+  - `--repo-ref REF`: checkout the named branch/tag/commit after cloning.
 - Return `task_id` to stdout.
 
 ### 3.2 `send`
@@ -83,7 +88,7 @@ codex-tasks archive <task_id>
 
 ## 6. Worker lifecycle
 1. **Spawn**: parent CLI forks a worker, writes initial files, and returns `task_id`.
-2. **Initialization**: worker launches `codex proto` with piped stdin/stdout, replicating existing `codex-task` logic.
+2. **Initialization**: worker launches `codex proto` with piped stdin/stdout, replicating existing `codex-task` logic, honoring any custom config file and working directory derived from the CLI flags.
 3. **Main loop**:
    - Keep `<task_id>.pipe` open for reading; translate each UTF-8 segment into a prompt. The worker tolerates writers connecting and disconnecting repeatedly, only reacting to the explicit `/quit` sentinel.
    - Forward Codex events to the renderer, appending to `<task_id>.log` and updating `<task_id>.result` when appropriate.
@@ -118,9 +123,5 @@ archive → ARCHIVED (files moved to archive/…)
 ## 10. Future enhancements (out of scope for initial version)
 - Optional metadata cache (`meta.json`) to avoid scanning directories on `ls`.
 - Structured JSON output for `status` / `ls`.
-- Configuration customization templates for workers:
-  - Start worker in another directory
-  - Worker in containers, i.e. Docker
-  - Worker initialization scripts, i.e. repo cloning, dependencies installation
-  - Secrets management
+- Additional configuration customization templates for workers (beyond current CLI flags), such as containerized execution, scripted dependency installation, or secrets management.
 - Integration hooks for external orchestrators.

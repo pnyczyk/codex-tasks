@@ -14,6 +14,8 @@ pub struct WorkerLaunchRequest {
     pub title: Option<String>,
     pub prompt: Option<String>,
     pub executable: Option<PathBuf>,
+    pub config_path: Option<PathBuf>,
+    pub working_directory: Option<PathBuf>,
 }
 
 impl WorkerLaunchRequest {
@@ -24,6 +26,8 @@ impl WorkerLaunchRequest {
             title: None,
             prompt: None,
             executable: None,
+            config_path: None,
+            working_directory: None,
         }
     }
 }
@@ -35,6 +39,8 @@ pub fn spawn_worker(request: WorkerLaunchRequest) -> Result<Child> {
         title,
         prompt,
         executable,
+        config_path,
+        working_directory,
     } = request;
 
     task_paths.ensure_directory()?;
@@ -62,6 +68,16 @@ pub fn spawn_worker(request: WorkerLaunchRequest) -> Result<Child> {
 
     if let Some(prompt) = prompt {
         command.env(PROMPT_ENV_VAR, prompt);
+    }
+
+    if let Some(config_path) = config_path {
+        command.arg("--config-path");
+        command.arg(config_path);
+    }
+
+    if let Some(working_directory) = working_directory {
+        command.arg("--working-dir");
+        command.arg(working_directory);
     }
 
     command.stdin(Stdio::null());

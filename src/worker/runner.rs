@@ -1,4 +1,5 @@
 use std::io::IsTerminal;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -11,6 +12,12 @@ use tokio::sync::mpsc;
 
 use super::event_processor::{CodexStatus, EventProcessor};
 use super::event_processor_with_human_output::EventProcessorWithHumanOutput;
+
+#[derive(Debug, Default)]
+pub(crate) struct ProtoLaunchOptions {
+    pub working_dir: Option<PathBuf>,
+    pub config_home: Option<PathBuf>,
+}
 
 /// Convenience entry point that mirrors the original interactive binary.
 #[allow(dead_code)]
@@ -26,7 +33,7 @@ pub(crate) async fn run_interactive_session() -> Result<()> {
         child,
         stdout,
         stdin,
-    } = spawn_codex_proto().await?;
+    } = spawn_codex_proto(&ProtoLaunchOptions::default()).await?;
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Event>();
     tokio::spawn(async move {
@@ -74,13 +81,21 @@ pub(crate) async fn send_submission(
 }
 
 #[allow(dead_code)]
-pub(crate) async fn spawn_codex_proto() -> Result<ChildHandles> {
+pub(crate) async fn spawn_codex_proto(options: &ProtoLaunchOptions) -> Result<ChildHandles> {
     let mut command = Command::new("codex");
     command.arg("proto");
     command.stdin(Stdio::piped());
     command.stdout(Stdio::piped());
     if std::env::var_os("RUST_LOG").is_none() {
         command.env("RUST_LOG", "off");
+    }
+
+    if let Some(dir) = &options.working_dir {
+        command.current_dir(dir);
+    }
+
+    if let Some(home) = &options.config_home {
+        command.env("CODEX_HOME", home);
     }
 
     let mut child = command.spawn().context("failed to spawn `codex proto`")?;

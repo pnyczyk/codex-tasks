@@ -5,15 +5,18 @@ pub mod task;
 pub mod worker;
 
 use std::collections::VecDeque;
+use std::env;
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, ErrorKind, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command as StdCommand;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use chrono::Utc;
 use clap::Parser;
 use libc::{ENXIO, O_NONBLOCK};
@@ -46,7 +49,17 @@ fn dispatch(cli: Cli) -> Result<()> {
 }
 
 fn handle_start(args: StartArgs) -> Result<()> {
-    let StartArgs { title, prompt } = args;
+    let StartArgs {
+        title,
+        prompt,
+        config_file,
+        working_dir,
+        repo,
+        repo_ref,
+    } = args;
+
+    let config_file = resolve_config_file(config_file)?;
+    let working_dir = prepare_working_directory(working_dir, repo.as_deref(), repo_ref.as_deref())?;
 
     let store = TaskStore::default().context("failed to locate task store")?;
     store
@@ -72,11 +85,182 @@ fn handle_start(args: StartArgs) -> Result<()> {
     let mut request = WorkerLaunchRequest::new(task_paths);
     request.title = title;
     request.prompt = prompt;
+    request.config_path = config_file;
+    request.working_directory = working_dir;
     let _child = spawn_worker(request).context("failed to launch worker process")?;
 
     println!("{task_id}");
 
     Ok(())
+}
+
+fn resolve_config_file(path: Option<PathBuf>) -> Result<Option<PathBuf>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+
+    let absolute = make_absolute(path)?;
+    let canonical = absolute
+        .canonicalize()
+        .with_context(|| format!("failed to resolve config file at {}", absolute.display()))?;
+    ensure!(
+        canonical.is_file(),
+        "config file {} does not exist or is not a file",
+        canonical.display()
+    );
+    let name = canonical
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| {
+            anyhow!(
+                "config file path {} is missing file name",
+                canonical.display()
+            )
+        })?;
+    ensure!(
+        name == "config.toml",
+        "custom config file must be named `config.toml` (got {name})",
+        name = name
+    );
+    Ok(Some(canonical))
+}
+
+fn prepare_working_directory(
+    working_dir: Option<PathBuf>,
+    repo: Option<&str>,
+    repo_ref: Option<&str>,
+) -> Result<Option<PathBuf>> {
+    let resolved = match working_dir {
+        Some(path) => Some(make_absolute(path)?),
+        None => None,
+    };
+
+    if repo.is_some() {
+        let repo_url = repo.unwrap();
+        let repo_spec_storage = if Path::new(repo_url).exists() {
+            Some(make_absolute(PathBuf::from(repo_url))?.into_os_string())
+        } else {
+            None
+        };
+        let repo_spec: &OsStr = repo_spec_storage
+            .as_deref()
+            .unwrap_or_else(|| OsStr::new(repo_url));
+        let target = resolved
+            .as_ref()
+            .ok_or_else(|| anyhow!("`--working-dir` is required when `--repo` is provided"))?;
+        clone_repository(repo_spec, repo_ref, target)?;
+    } else if let Some(path) = resolved.as_ref() {
+        if !path.exists() {
+            fs::create_dir_all(path).with_context(|| {
+                format!("failed to create working directory {}", path.display())
+            })?;
+        }
+    }
+
+    match resolved {
+        Some(path) => {
+            let canonical = path.canonicalize().with_context(|| {
+                format!("failed to resolve working directory {}", path.display())
+            })?;
+            Ok(Some(canonical))
+        }
+        None => Ok(None),
+    }
+}
+
+fn clone_repository(repo_spec: &OsStr, repo_ref: Option<&str>, target_dir: &Path) -> Result<()> {
+    let parent = target_dir.parent().ok_or_else(|| {
+        anyhow!(
+            "working directory {} is missing a parent directory",
+            target_dir.display()
+        )
+    })?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create parent directory {}", parent.display()))?;
+
+    if target_dir.exists() {
+        bail!(
+            "working directory {} already exists; remove it or choose a different directory before cloning",
+            target_dir.display()
+        );
+    }
+
+    let name = target_dir.file_name().ok_or_else(|| {
+        anyhow!(
+            "working directory {} is missing a final path component",
+            target_dir.display()
+        )
+    })?;
+
+    let status = StdCommand::new("git")
+        .current_dir(parent)
+        .arg("clone")
+        .arg(repo_spec)
+        .arg(name)
+        .status()
+        .with_context(|| {
+            format!(
+                "failed to run `git clone` for {}",
+                repo_spec.to_string_lossy()
+            )
+        })?;
+    ensure!(
+        status.success(),
+        "`git clone` for {} exited with status {status}",
+        repo_spec.to_string_lossy(),
+        status = status
+    );
+
+    if let Some(reference) = repo_ref {
+        let mut checkout_status = StdCommand::new("git")
+            .current_dir(target_dir)
+            .args(["checkout", reference])
+            .status()
+            .with_context(|| format!("failed to checkout {reference} in cloned repository"))?;
+
+        if !checkout_status.success() {
+            let fetch_status = StdCommand::new("git")
+                .current_dir(target_dir)
+                .args(["fetch", "origin", reference])
+                .status()
+                .with_context(|| {
+                    format!(
+                        "failed to fetch {reference} from {}",
+                        repo_spec.to_string_lossy()
+                    )
+                })?;
+            ensure!(
+                fetch_status.success(),
+                "`git fetch origin {reference}` exited with status {fetch_status}",
+                reference = reference,
+                fetch_status = fetch_status
+            );
+
+            checkout_status = StdCommand::new("git")
+                .current_dir(target_dir)
+                .args(["checkout", reference])
+                .status()
+                .with_context(|| format!("failed to checkout {reference} after fetch"))?;
+        }
+
+        ensure!(
+            checkout_status.success(),
+            "`git checkout {reference}` exited with status {checkout_status}",
+            reference = reference,
+            checkout_status = checkout_status
+        );
+    }
+
+    Ok(())
+}
+
+fn make_absolute(path: PathBuf) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        let cwd = env::current_dir().context("failed to resolve current working directory")?;
+        Ok(cwd.join(path))
+    }
 }
 
 fn handle_send(args: SendArgs) -> Result<()> {
@@ -373,6 +557,8 @@ fn handle_worker(args: WorkerArgs) -> Result<()> {
         args.store_root,
         args.title,
         args.prompt,
+        args.config_path,
+        args.working_dir,
     )?;
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

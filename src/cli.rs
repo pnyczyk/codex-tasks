@@ -47,6 +47,18 @@ pub struct StartArgs {
     /// Optional human readable title for the new task.
     #[arg(short = 't', long)]
     pub title: Option<String>,
+    /// Path to a custom Codex config file that should be used by `codex proto`.
+    #[arg(long = "config-file", value_name = "PATH")]
+    pub config_file: Option<PathBuf>,
+    /// Working directory where `codex proto` should run.
+    #[arg(long = "working-dir", value_name = "DIR")]
+    pub working_dir: Option<PathBuf>,
+    /// Git repository to clone into the working directory before starting.
+    #[arg(long = "repo", value_name = "URL")]
+    pub repo: Option<String>,
+    /// Git branch, tag, or commit to check out after cloning the repository.
+    #[arg(long = "repo-ref", value_name = "REF")]
+    pub repo_ref: Option<String>,
     /// Initial prompt to send immediately after the worker launches.
     pub prompt: Option<String>,
 }
@@ -123,4 +135,10 @@ pub struct WorkerArgs {
     /// Optional prompt to send once the worker is fully initialized.
     #[arg(long)]
     pub prompt: Option<String>,
+    /// Optional Codex config file that should override the default configuration.
+    #[arg(long = "config-path")]
+    pub config_path: Option<PathBuf>,
+    /// Optional working directory for launching `codex proto`.
+    #[arg(long = "working-dir")]
+    pub working_dir: Option<PathBuf>,
 }
