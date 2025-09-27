@@ -1423,6 +1423,37 @@ fn log_follow_exits_when_task_idle() {
 }
 
 #[test]
+fn log_follow_waits_for_log_file_creation() {
+    let home = tempdir().expect("tempdir");
+    let tasks_root = home.path().join(".codex").join("tasks");
+    let task_id = "task-wait";
+    let task_dir = tasks_root.join(task_id);
+    fs::create_dir_all(&task_dir).expect("task dir");
+    write_metadata(&tasks_root, task_id, "IDLE");
+
+    let log_path = task_dir.join("task.log");
+    let writer = thread::spawn({
+        let log_path = log_path.clone();
+        move || {
+            thread::sleep(Duration::from_millis(200));
+            fs::write(&log_path, b"line one\nline two\n").expect("write log contents");
+        }
+    });
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    let assert = cmd
+        .env("HOME", home.path())
+        .args(["log", "-f", task_id])
+        .assert()
+        .success();
+
+    writer.join().expect("writer thread");
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    assert_eq!(stdout, "line one\nline two\n");
+}
+
+#[test]
 fn log_follow_exits_for_archived_tasks() {
     let home = tempdir().expect("tempdir");
     let log_path = home
