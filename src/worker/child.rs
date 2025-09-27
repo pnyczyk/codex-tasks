@@ -7,8 +7,8 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
-use codex_core::config::{Config, ConfigOverrides};
+use anyhow::{Context, Result, anyhow};
+use codex_core::config::{Config, ConfigOverrides, ConfigToml};
 use codex_core::protocol::{Event, EventMsg};
 use tokio::fs::OpenOptions as TokioOpenOptions;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -18,7 +18,7 @@ use crate::storage::{TaskPaths, TaskStore};
 use crate::task::{TaskId, TaskState};
 use crate::worker::event_processor::{CodexStatus, EventProcessor};
 use crate::worker::event_processor_with_human_output::EventProcessorWithHumanOutput;
-use crate::worker::runner;
+use crate::worker::runner::{self, ProtoLaunchOptions};
 
 /// Environment variable that carries the optional title for the worker.
 pub const TITLE_ENV_VAR: &str = "CODEX_TASK_TITLE";
@@ -34,6 +34,8 @@ pub struct WorkerConfig {
     pub store_root: PathBuf,
     pub title: Option<String>,
     pub initial_prompt: Option<String>,
+    pub config_path: Option<PathBuf>,
+    pub working_dir: Option<PathBuf>,
 }
 
 impl WorkerConfig {
@@ -44,14 +46,31 @@ impl WorkerConfig {
         store_root: PathBuf,
         title: Option<String>,
         initial_prompt: Option<String>,
+        config_path: Option<PathBuf>,
+        working_dir: Option<PathBuf>,
     ) -> Result<Self> {
         let title = title.or_else(|| env::var(TITLE_ENV_VAR).ok());
         let initial_prompt = initial_prompt.or_else(|| env::var(PROMPT_ENV_VAR).ok());
+        let config_path =
+            match config_path {
+                Some(path) => Some(path.canonicalize().with_context(|| {
+                    format!("failed to resolve config file at {}", path.display())
+                })?),
+                None => None,
+            };
+        let working_dir = match working_dir {
+            Some(path) => Some(path.canonicalize().with_context(|| {
+                format!("failed to resolve working directory {}", path.display())
+            })?),
+            None => None,
+        };
         Ok(Self {
             task_id,
             store_root,
             title,
             initial_prompt,
+            config_path,
+            working_dir,
         })
     }
 
@@ -98,8 +117,8 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
 
     redirect_stdio_to(&log_file).context("failed to redirect worker output to log file")?;
 
-    let codex_config = Config::load_with_cli_overrides(Vec::new(), ConfigOverrides::default())
-        .context("failed to load Codex configuration")?;
+    let (codex_config, codex_home_override) =
+        load_codex_config(worker_config.config_path.as_deref())?;
 
     let event_processor = EventProcessorWithHumanOutput::create_with_ansi(
         false,
@@ -108,11 +127,16 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
     );
     let mut event_processor = MetadataAwareProcessor::new(event_processor, paths.clone());
 
+    let proto_options = ProtoLaunchOptions {
+        working_dir: worker_config.working_dir.clone(),
+        config_home: codex_home_override.clone(),
+    };
+
     let runner::ChildHandles {
         child,
         stdout,
         stdin,
-    } = runner::spawn_codex_proto().await?;
+    } = runner::spawn_codex_proto(&proto_options).await?;
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Event>();
     tokio::spawn(async move {
@@ -171,6 +195,40 @@ pub async fn run_worker(config: WorkerConfig) -> Result<()> {
     }
 
     result
+}
+
+fn load_codex_config(config_path: Option<&Path>) -> Result<(Config, Option<PathBuf>)> {
+    match config_path {
+        Some(path) => {
+            let parent = path.parent().ok_or_else(|| {
+                anyhow!(
+                    "config file {} does not have a parent directory",
+                    path.display()
+                )
+            })?;
+            let contents = fs::read_to_string(path)
+                .with_context(|| format!("failed to read config file at {}", path.display()))?;
+            let cfg: ConfigToml = toml::from_str(&contents)
+                .with_context(|| format!("failed to parse config file at {}", path.display()))?;
+            let config = Config::load_from_base_config_with_overrides(
+                cfg,
+                ConfigOverrides::default(),
+                parent.to_path_buf(),
+            )
+            .with_context(|| {
+                format!(
+                    "failed to build Codex configuration from {}",
+                    path.display()
+                )
+            })?;
+            Ok((config, Some(parent.to_path_buf())))
+        }
+        None => {
+            let config = Config::load_with_cli_overrides(Vec::new(), ConfigOverrides::default())
+                .context("failed to load Codex configuration")?;
+            Ok((config, None))
+        }
+    }
 }
 
 fn should_exit_after_start() -> bool {
@@ -433,6 +491,8 @@ mod tests {
             tmp.path().to_path_buf(),
             Some("cli title".to_string()),
             Some("cli prompt".to_string()),
+            None,
+            None,
         )
         .expect("config");
         assert_eq!(config.title.as_deref(), Some("cli title"));
@@ -447,8 +507,15 @@ mod tests {
         set_env(TITLE_ENV_VAR, "env title");
         set_env(PROMPT_ENV_VAR, "env prompt");
         let tmp = tempdir().expect("tempdir");
-        let config = WorkerConfig::new("task-2".to_string(), tmp.path().to_path_buf(), None, None)
-            .expect("config");
+        let config = WorkerConfig::new(
+            "task-2".to_string(),
+            tmp.path().to_path_buf(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("config");
         assert_eq!(config.title.as_deref(), Some("env title"));
         assert_eq!(config.initial_prompt.as_deref(), Some("env prompt"));
         remove_env(TITLE_ENV_VAR);
@@ -462,8 +529,8 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let task_id = "task-3".to_string();
         let store_root = tmp.path().to_path_buf();
-        let config =
-            WorkerConfig::new(task_id.clone(), store_root.clone(), None, None).expect("config");
+        let config = WorkerConfig::new(task_id.clone(), store_root.clone(), None, None, None, None)
+            .expect("config");
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

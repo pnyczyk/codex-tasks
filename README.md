@@ -40,6 +40,12 @@ The CLI exposes several subcommands; run `codex-tasks <command> --help` for full
 | `codex-tasks ls [-a\|--all] [--state <STATE> ...]` | List active tasks, optionally including archived ones and filtering by state. |
 | `codex-tasks archive <task_id>` | Move task files into the archive hierarchy after completion. |
 
+The `start` subcommand accepts additional flags for tailoring the worker environment:
+- `--config-file PATH` loads a custom `config.toml` for `codex proto` (the file must be named `config.toml`).
+- `--working-dir DIR` runs `codex proto` inside the specified directory, creating it when needed.
+- `--repo URL` clones a Git repository into the working directory before launching the worker (requires `--working-dir`).
+- `--repo-ref REF` checks out the given branch, tag, or commit after cloning the repository.
+
 ### Typical workflow
 ```bash
 # Start a task with an initial question and capture the generated task ID

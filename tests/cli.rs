@@ -21,6 +21,52 @@ use uuid::Uuid;
 
 const BIN: &str = "codex-tasks";
 
+fn git(dir: &Path, args: &[&str]) {
+    let status = StdCommand::new("git")
+        .args(args)
+        .current_dir(dir)
+        .status()
+        .expect("run git");
+    assert!(
+        status.success(),
+        "git {:?} failed with status {:?}",
+        args,
+        status
+    );
+}
+
+fn git_commit(dir: &Path, message: &str) {
+    let status = StdCommand::new("git")
+        .args(["commit", "-m", message])
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "Codex Tests")
+        .env("GIT_AUTHOR_EMAIL", "codex-tests@example.com")
+        .env("GIT_COMMITTER_NAME", "Codex Tests")
+        .env("GIT_COMMITTER_EMAIL", "codex-tests@example.com")
+        .status()
+        .expect("run git commit");
+    assert!(
+        status.success(),
+        "git commit failed with status {:?}",
+        status
+    );
+}
+
+fn init_repo_with_feature_branch(path: &Path) {
+    git(path, &["init"]);
+    git(path, &["config", "user.email", "codex-tests@example.com"]);
+    git(path, &["config", "user.name", "Codex Tests"]);
+
+    fs::write(path.join("main.txt"), "main branch").expect("write main file");
+    git(path, &["add", "main.txt"]);
+    git_commit(path, "initial commit");
+
+    git(path, &["checkout", "-b", "feature"]);
+    fs::write(path.join("feature.txt"), "feature branch").expect("write feature file");
+    git(path, &["add", "feature.txt"]);
+    git_commit(path, "feature commit");
+}
+
 #[test]
 fn help_lists_supported_subcommands() {
     let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
@@ -357,6 +403,122 @@ fn start_without_prompt_sets_idle_state() {
         serde_json::from_str(&fs::read_to_string(&metadata_path).expect("read metadata"))
             .expect("parse metadata");
     assert_eq!(metadata["state"], "IDLE");
+}
+
+#[test]
+fn start_requires_working_dir_when_repo_specified() {
+    let home = tempdir().expect("tempdir");
+    let source_repo = tempdir().expect("tempdir");
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    cmd.arg("start")
+        .arg("--repo")
+        .arg(source_repo.path())
+        .env("HOME", home.path())
+        .env("CODEX_TASKS_EXIT_AFTER_START", "1");
+    cmd.assert()
+        .failure()
+        .stderr(predicates::str::contains("--working-dir"));
+}
+
+#[test]
+fn start_with_repo_ref_clones_branch_into_working_dir() {
+    let home = tempdir().expect("tempdir");
+    let repo_src = tempdir().expect("tempdir");
+    init_repo_with_feature_branch(repo_src.path());
+
+    let working_dir = home.path().join("workspace").join("cloned");
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    cmd.arg("start")
+        .arg("--title")
+        .arg("Repo Task")
+        .arg("--working-dir")
+        .arg(&working_dir)
+        .arg("--repo")
+        .arg(repo_src.path())
+        .arg("--repo-ref")
+        .arg("feature")
+        .env("HOME", home.path())
+        .env("CODEX_TASKS_EXIT_AFTER_START", "1");
+    let assert = cmd.assert().success();
+    let task_id = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    assert!(!task_id.trim().is_empty(), "start should print a task id");
+
+    assert!(
+        working_dir.join("feature.txt").exists(),
+        "feature file should exist after cloning"
+    );
+    let head_path = working_dir.join(".git").join("HEAD");
+    let head = fs::read_to_string(&head_path).expect("read head");
+    assert!(
+        head.contains("feature"),
+        "expected HEAD to reference feature branch, got {head}"
+    );
+}
+
+#[test]
+fn start_rejects_custom_config_with_wrong_filename() {
+    let home = tempdir().expect("tempdir");
+    let config_dir = home.path().join("config");
+    fs::create_dir_all(&config_dir).expect("config dir");
+    let config_path = config_dir.join("custom.toml");
+    fs::write(&config_path, "model = \"o3\"").expect("write config");
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    cmd.arg("start")
+        .arg("--config-file")
+        .arg(&config_path)
+        .env("HOME", home.path())
+        .env("CODEX_TASKS_EXIT_AFTER_START", "1");
+    cmd.assert().failure().stderr(predicates::str::contains(
+        "custom config file must be named",
+    ));
+}
+
+#[test]
+fn start_clones_local_repo_using_relative_path() {
+    let home = tempdir().expect("tempdir");
+    let repo_dir = home.path().join("local_repo");
+    fs::create_dir_all(&repo_dir).expect("repo dir");
+    init_repo_with_feature_branch(&repo_dir);
+
+    let working_dir = home.path().join("workspace").join("clone");
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    cmd.current_dir(home.path())
+        .arg("start")
+        .arg("--working-dir")
+        .arg(&working_dir)
+        .arg("--repo")
+        .arg("./local_repo")
+        .env("HOME", home.path())
+        .env("CODEX_TASKS_EXIT_AFTER_START", "1");
+    let assert = cmd.assert().success();
+    let task_id = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    assert!(!task_id.trim().is_empty(), "start should print a task id");
+
+    assert!(
+        working_dir.join("feature.txt").exists(),
+        "feature file should be present in cloned repo"
+    );
+}
+
+#[test]
+fn start_accepts_custom_config_named_config_toml() {
+    let home = tempdir().expect("tempdir");
+    let config_dir = home.path().join("config");
+    fs::create_dir_all(&config_dir).expect("config dir");
+    let config_path = config_dir.join("config.toml");
+    fs::write(&config_path, "model = \"o3\"").expect("write config");
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    cmd.arg("start")
+        .arg("--config-file")
+        .arg(&config_path)
+        .env("HOME", home.path())
+        .env("CODEX_TASKS_EXIT_AFTER_START", "1");
+    cmd.assert().success();
 }
 
 #[test]
