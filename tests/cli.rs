@@ -694,6 +694,36 @@ fn stop_handles_missing_task_gracefully() {
 }
 
 #[test]
+fn stop_all_stops_idle_tasks() {
+    let env = IntegrationTestEnv::new();
+    let first = env.start_task("Idle One", "prompt one");
+    let second = env.start_task("Idle Two", "prompt two");
+
+    env.wait_for_condition(&first, |value| value["state"] == "IDLE");
+    env.wait_for_condition(&second, |value| value["state"] == "IDLE");
+
+    let mut cmd = env.command();
+    let assert = cmd.args(["stop", "-a"]).assert().success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    assert!(stdout.contains(&format!("Task {} stopped.", first)));
+    assert!(stdout.contains(&format!("Task {} stopped.", second)));
+    assert!(stdout.contains("Stopped 2 idle task(s); 0 already stopped."));
+
+    env.wait_for_condition(&first, |value| value["state"] == "STOPPED");
+    env.wait_for_condition(&second, |value| value["state"] == "STOPPED");
+}
+
+#[test]
+fn stop_all_reports_when_no_idle_tasks_found() {
+    let tmp = tempdir().expect("tempdir");
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    cmd.env("HOME", tmp.path()).args(["stop", "--all"]);
+    cmd.assert()
+        .success()
+        .stdout(predicates::str::contains("No idle tasks to stop."));
+}
+
+#[test]
 fn archive_moves_task_into_archive() {
     let tmp = tempdir().expect("tempdir");
     let home = tmp.path();

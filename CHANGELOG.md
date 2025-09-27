@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2025-09-27
+### Added
+- `codex-tasks stop` supports a `-a/--all` flag to gracefully stop every idle task in one command.
+- Integration coverage and documentation updates describing the bulk-stop workflow.
+
+### Changed
+- Bulk stopping prints per-task status and a summary of how many tasks were stopped versus already idle.
+
 ## [0.3.0] - 2025-09-27
 ### Added
 - `log -f` now exits automatically once the worker returns to `IDLE`, `STOPPED`, or `DIED`.

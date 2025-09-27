@@ -51,6 +51,7 @@ codex-tasks archive <task_id>
 ### 3.5 `stop`
 - Notify the worker to send `shutdown` to Codex, wait for `ShutdownComplete`, and clean up (`.pid`, `.pipe`).
 - After graceful exit, status becomes `STOPPED`.
+- `-a/--all` stops every task currently in the `IDLE` state, issuing the same graceful shutdown flow for each worker.
 
 ### 3.6 `ls`
 - List active tasks in `~/.codex/tasks/`.
