@@ -430,17 +430,17 @@ fn handle_log(args: LogArgs) -> Result<()> {
 fn handle_stop(args: StopArgs) -> Result<()> {
     let store = TaskStore::default()?;
     store.ensure_layout()?;
-    let paths = store.task(args.task_id.clone());
-    let outcome = stop_task(&paths)?;
-    match outcome {
-        StopOutcome::AlreadyStopped => {
-            println!("Task {} is not running; nothing to stop.", args.task_id);
-        }
-        StopOutcome::Stopped => {
-            println!("Task {} stopped.", args.task_id);
-        }
+    if args.all {
+        stop_all_idle_tasks(&store)
+    } else {
+        let task_id = args
+            .task_id
+            .expect("task id is required when --all is not specified");
+        let paths = store.task(task_id.clone());
+        let outcome = stop_task(&paths)?;
+        print_stop_outcome(&task_id, &outcome);
+        Ok(())
     }
-    Ok(())
 }
 
 fn handle_ls(args: LsArgs) -> Result<()> {
@@ -565,6 +565,52 @@ fn stop_task(paths: &TaskPaths) -> Result<StopOutcome> {
     mark_task_state(paths, TaskState::Stopped)?;
 
     Ok(StopOutcome::Stopped)
+}
+
+fn stop_all_idle_tasks(store: &TaskStore) -> Result<()> {
+    let mut idle = Vec::new();
+    for task in collect_active_tasks(store)? {
+        if task.metadata.state == TaskState::Idle {
+            idle.push(task.metadata.id.clone());
+        }
+    }
+
+    if idle.is_empty() {
+        println!("No idle tasks to stop.");
+        return Ok(());
+    }
+
+    let mut stopped = 0usize;
+    let mut already = 0usize;
+
+    for task_id in idle {
+        let paths = store.task(task_id.clone());
+        let outcome = stop_task(&paths)?;
+        print_stop_outcome(&task_id, &outcome);
+        match outcome {
+            StopOutcome::Stopped => stopped += 1,
+            StopOutcome::AlreadyStopped => already += 1,
+        }
+    }
+
+    println!(
+        "Stopped {stopped} idle task(s); {already} already stopped.",
+        stopped = stopped,
+        already = already
+    );
+
+    Ok(())
+}
+
+fn print_stop_outcome(task_id: &str, outcome: &StopOutcome) {
+    match outcome {
+        StopOutcome::AlreadyStopped => {
+            println!("Task {} is not running; nothing to stop.", task_id);
+        }
+        StopOutcome::Stopped => {
+            println!("Task {} stopped.", task_id);
+        }
+    }
 }
 
 fn send_quit_signal(paths: &TaskPaths) -> Result<bool> {

@@ -101,8 +101,16 @@ pub struct LogArgs {
 /// Arguments for the `stop` subcommand.
 #[derive(Debug, Args)]
 pub struct StopArgs {
+    /// Stop every idle task instead of targeting a specific identifier.
+    #[arg(short = 'a', long = "all")]
+    pub all: bool,
     /// Identifier of the task that should be stopped.
-    pub task_id: String,
+    #[arg(
+        conflicts_with = "all",
+        required_unless_present = "all",
+        value_name = "TASK_ID"
+    )]
+    pub task_id: Option<String>,
 }
 
 /// Arguments for the `ls` subcommand.

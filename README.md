@@ -36,7 +36,7 @@ The CLI exposes several subcommands; run `codex-tasks <command> --help` for full
 | `codex-tasks send <task_id> <prompt>` | Send another prompt to an existing task. |
 | `codex-tasks status [--json] <task_id>` | Show live status, metadata, and the last prompt/result. |
 | `codex-tasks log [-f\|--follow] [--forever] [-n <lines>] <task_id>` | Stream or tail the transcript for a task. |
-| `codex-tasks stop <task_id>` | Gracefully shut down the worker process. |
+| `codex-tasks stop [-a\|--all] [<task_id>]` | Gracefully shut down a worker; use `-a/--all` to stop every idle task. |
 | `codex-tasks ls [-a\|--all] [--state <STATE> ...]` | List active tasks, optionally including archived ones and filtering by state. |
 | `codex-tasks archive [-a\|--all] [<task_id>]` | Archive a specific task or bulk archive all STOPPED/DIED tasks. |
 
@@ -64,6 +64,7 @@ codex-tasks log -f "$TASK_ID"
 
 # Stop and archive when finished
 codex-tasks stop "$TASK_ID"
+codex-tasks stop -a   # stop all remaining idle tasks in bulk
 codex-tasks archive "$TASK_ID"
 ```
 

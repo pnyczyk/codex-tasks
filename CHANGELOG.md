@@ -8,9 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.3.1] - 2025-09-27
 ### Added
 - `archive -a/--all` bulk-archives every task currently in `STOPPED` or `DIED` state.
+- `codex-tasks stop` supports a `-a/--all` flag to gracefully stop every idle task in one command.
+- Integration coverage and documentation updates describing the bulk archive and bulk stop workflows.
 
 ### Changed
 - `archive` now skips running/idle tasks when using `-a` and reports skipped/archived tasks in the CLI output.
+- Bulk stopping prints per-task status and a summary of how many tasks were stopped versus already idle.
 
 ## [0.3.0] - 2025-09-27
 ### Added
