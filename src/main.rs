@@ -404,7 +404,8 @@ fn handle_status(args: StatusArgs) -> Result<()> {
 
 fn handle_log(args: LogArgs) -> Result<()> {
     let store = TaskStore::default()?;
-    let log_path = resolve_log_path(&store, &args.task_id)?;
+    let wait_for_log = args.follow || args.forever;
+    let log_path = resolve_log_path(&store, &args.task_id, wait_for_log)?;
     let file = File::open(&log_path).with_context(|| {
         format!(
             "failed to open log for task {} at {}",
@@ -535,6 +536,8 @@ enum StopOutcome {
 
 const SHUTDOWN_TIMEOUT_SECS: u64 = 10;
 const SHUTDOWN_POLL_INTERVAL_MS: u64 = 100;
+const LOG_WAIT_TIMEOUT_SECS: u64 = 10;
+const LOG_WAIT_POLL_INTERVAL_MS: u64 = 100;
 
 fn stop_task(paths: &TaskPaths) -> Result<StopOutcome> {
     let pid = match paths.read_pid()? {
@@ -800,21 +803,36 @@ fn read_metadata_file(path: &Path) -> Result<TaskMetadata> {
     Ok(metadata)
 }
 
-fn resolve_log_path(store: &TaskStore, task_id: &str) -> Result<PathBuf> {
+fn resolve_log_path(store: &TaskStore, task_id: &str, wait: bool) -> Result<PathBuf> {
     let active_path = store.task(task_id.to_string()).log_path();
-    if active_path.exists() {
-        return Ok(active_path);
-    }
+    let deadline = if wait {
+        Some(Instant::now() + Duration::from_secs(LOG_WAIT_TIMEOUT_SECS))
+    } else {
+        None
+    };
 
-    if let Some(path) = find_archived_log_path(store, task_id)? {
-        return Ok(path);
-    }
+    loop {
+        if active_path.exists() {
+            return Ok(active_path.clone());
+        }
 
-    bail!(
-        "log file for task {task_id} was not found under {} or {}",
-        store.root().display(),
-        store.archive_root().display()
-    )
+        if let Some(path) = find_archived_log_path(store, task_id)? {
+            return Ok(path);
+        }
+
+        match deadline {
+            Some(limit) if Instant::now() < limit => {
+                thread::sleep(Duration::from_millis(LOG_WAIT_POLL_INTERVAL_MS));
+            }
+            Some(_) | None => {
+                bail!(
+                    "log file for task {task_id} was not found under {} or {}",
+                    store.root().display(),
+                    store.archive_root().display()
+                );
+            }
+        }
+    }
 }
 
 fn find_archived_log_path(store: &TaskStore, task_id: &str) -> Result<Option<PathBuf>> {
