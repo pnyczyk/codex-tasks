@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use chrono::Utc;
 use clap::Parser;
+use codex_protocol::num_format::format_with_separators;
+use serde_json::Value;
 
 use crate::cli::{
     ArchiveArgs, Cli, Command, LogArgs, LsArgs, SendArgs, StartArgs, StatusArgs, StopArgs,
@@ -58,6 +60,14 @@ fn handle_start(args: StartArgs) -> Result<()> {
     let prompt = resolve_start_prompt(prompt)?;
     let config_file = resolve_config_file(config_file)?;
     let working_dir = prepare_working_directory(working_dir, repo.as_deref(), repo_ref.as_deref())?;
+    let working_dir = match working_dir {
+        Some(path) => Some(make_absolute(path)?),
+        None => {
+            let cwd = env::current_dir()
+                .context("failed to determine current working directory for worker")?;
+            Some(make_absolute(cwd)?)
+        }
+    };
 
     let store = TaskStore::default().context("failed to locate task store")?;
     store
@@ -67,7 +77,7 @@ fn handle_start(args: StartArgs) -> Result<()> {
     let mut request = WorkerLaunchRequest::new(store.root().to_path_buf(), prompt);
     request.title = title;
     request.config_path = config_file;
-    request.working_directory = working_dir;
+    request.working_directory = working_dir.clone();
 
     let mut child = spawn_worker(request).context("failed to launch worker process")?;
     let thread_id = receive_thread_id(&mut child)?;
@@ -407,16 +417,33 @@ fn handle_log(args: LogArgs) -> Result<()> {
         )
     })?;
     let mut reader = BufReader::new(file);
-    print_initial_log(&mut reader, args.lines)?;
-    let should_follow = args.follow || args.forever;
-    if should_follow {
-        let metadata = resolve_follow_metadata(&store, &args.task_id)?;
-        let context = FollowContext {
-            task_id: args.task_id,
-            metadata,
-            forever: args.forever,
-        };
-        follow_log(&mut reader, context)?;
+    if args.json {
+        print_initial_log(&mut reader, args.lines)?;
+
+        let should_follow = args.follow || args.forever;
+        if should_follow {
+            let metadata = resolve_follow_metadata(&store, &args.task_id)?;
+            let context = FollowContext {
+                task_id: args.task_id,
+                metadata,
+                forever: args.forever,
+            };
+            follow_log(&mut reader, context)?;
+        }
+    } else {
+        let mut human_state = HumanRenderState::new();
+        print_initial_log_human(&mut reader, args.lines, &mut human_state)?;
+
+        let should_follow = args.follow || args.forever;
+        if should_follow {
+            let metadata = resolve_follow_metadata(&store, &args.task_id)?;
+            let context = FollowContext {
+                task_id: args.task_id,
+                metadata,
+                forever: args.forever,
+            };
+            follow_log_human(&mut reader, context, &mut human_state)?;
+        }
     }
     Ok(())
 }
@@ -462,16 +489,16 @@ fn handle_ls(args: LsArgs) -> Result<()> {
 
     println!(
         "{:<36}  {:<20}  {:<10}  {:<25}  {:<25}  {}",
-        "ID", "Title", "State", "Created At", "Updated At", "Location"
+        "ID", "Title", "State", "Created At", "Updated At", "Working Dir"
     );
     for entry in tasks {
         let title = entry.metadata.title.as_deref().unwrap_or("-");
         let created = entry.metadata.created_at.to_rfc3339();
         let updated = entry.metadata.updated_at.to_rfc3339();
-        let location = if entry.archived { "ARCHIVE" } else { "ACTIVE" };
+        let working_dir = entry.metadata.working_dir.as_deref().unwrap_or("-");
         println!(
             "{:<36}  {:<20}  {:<10}  {:<25}  {:<25}  {}",
-            entry.metadata.id, title, entry.metadata.state, created, updated, location
+            entry.metadata.id, title, entry.metadata.state, created, updated, working_dir
         );
     }
 
@@ -690,7 +717,6 @@ fn is_process_running(pid: i32) -> Result<bool> {
 
 struct ListedTask {
     metadata: TaskMetadata,
-    archived: bool,
 }
 
 fn collect_active_tasks(store: &TaskStore) -> Result<Vec<ListedTask>> {
@@ -724,10 +750,7 @@ fn collect_active_tasks(store: &TaskStore) -> Result<Vec<ListedTask>> {
         if metadata.last_result.is_none() {
             metadata.last_result = task_paths.read_last_result()?;
         }
-        tasks.push(ListedTask {
-            metadata,
-            archived: false,
-        });
+        tasks.push(ListedTask { metadata });
     }
 
     Ok(tasks)
@@ -745,10 +768,7 @@ fn collect_archived_tasks(store: &TaskStore) -> Result<Vec<ListedTask>> {
         let metadata_path = dir.join(METADATA_FILE_NAME);
         if metadata_path.exists() {
             let metadata = read_metadata_file(&metadata_path)?;
-            tasks.push(ListedTask {
-                metadata,
-                archived: true,
-            });
+            tasks.push(ListedTask { metadata });
             continue;
         }
 
@@ -988,6 +1008,371 @@ fn follow_log(reader: &mut BufReader<File>, context: FollowContext) -> Result<()
     }
 
     Ok(())
+}
+
+fn print_initial_log_human(
+    reader: &mut BufReader<File>,
+    limit: Option<usize>,
+    state: &mut HumanRenderState,
+) -> Result<()> {
+    let mut buffer = String::new();
+    let mut stdout = io::stdout();
+
+    match limit {
+        Some(limit) => {
+            let mut lines = VecDeque::new();
+            loop {
+                buffer.clear();
+                let bytes = read_line_retry(reader, &mut buffer)
+                    .context("failed to read from log while preparing output")?;
+                if bytes == 0 {
+                    break;
+                }
+
+                if limit == 0 {
+                    continue;
+                }
+
+                if lines.len() == limit {
+                    lines.pop_front();
+                }
+                lines.push_back(buffer.clone());
+            }
+
+            for line in lines {
+                write_humanized_line(&line, state, &mut stdout)?;
+            }
+        }
+        None => loop {
+            buffer.clear();
+            let bytes = read_line_retry(reader, &mut buffer)
+                .context("failed to read from log while preparing output")?;
+            if bytes == 0 {
+                break;
+            }
+            write_humanized_line(&buffer, state, &mut stdout)?;
+        },
+    }
+
+    stdout
+        .flush()
+        .context("failed to flush log output to stdout")?;
+    Ok(())
+}
+
+fn follow_log_human(
+    reader: &mut BufReader<File>,
+    context: FollowContext,
+    state: &mut HumanRenderState,
+) -> Result<()> {
+    let mut buffer = String::new();
+    let mut stdout = io::stdout();
+    let mut idle_pending = false;
+
+    loop {
+        buffer.clear();
+        match read_line_retry(reader, &mut buffer) {
+            Ok(0) => {
+                stdout
+                    .flush()
+                    .context("failed to flush log output to stdout")?;
+
+                if context.forever {
+                    thread::sleep(Duration::from_millis(250));
+                    continue;
+                }
+
+                match context.current_state() {
+                    Ok(Some(TaskState::Running)) => {
+                        idle_pending = false;
+                    }
+                    Ok(Some(TaskState::Stopped)) => {
+                        if idle_pending {
+                            eprintln!("Task {} is STOPPED; stopping log follow.", context.task_id);
+                            break;
+                        }
+                        idle_pending = true;
+                    }
+                    Ok(Some(state @ (TaskState::Died | TaskState::Archived))) => {
+                        eprintln!(
+                            "Task {} is {}; stopping log follow.",
+                            context.task_id,
+                            state.as_str()
+                        );
+                        break;
+                    }
+                    Ok(None) => {
+                        eprintln!(
+                            "Task {} state unavailable; stopping log follow.",
+                            context.task_id
+                        );
+                        break;
+                    }
+                    Err(err) => {
+                        eprintln!("Failed to read state for task {}: {err:#}", context.task_id);
+                        break;
+                    }
+                }
+
+                thread::sleep(Duration::from_millis(250));
+            }
+            Ok(_) => {
+                idle_pending = false;
+                write_humanized_line(&buffer, state, &mut stdout)?;
+            }
+            Err(err) => {
+                return Err(err).context("failed to read from log while following");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn write_humanized_line(
+    raw_line: &str,
+    state: &mut HumanRenderState,
+    stdout: &mut io::Stdout,
+) -> Result<()> {
+    let trimmed = raw_line.trim_end();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    let value: Value = match serde_json::from_str(trimmed) {
+        Ok(val) => val,
+        Err(err) => {
+            eprintln!("failed to parse log line as JSON: {err}");
+            return Ok(());
+        }
+    };
+
+    let lines = state.render_event(&value);
+    for line in lines {
+        stdout
+            .write_all(line.as_bytes())
+            .context("failed to write log output")?;
+        stdout
+            .write_all(b"\n")
+            .context("failed to write log output")?;
+    }
+
+    Ok(())
+}
+
+struct HumanRenderState {
+    last_agent_message: Option<String>,
+}
+
+impl HumanRenderState {
+    fn new() -> Self {
+        Self {
+            last_agent_message: None,
+        }
+    }
+
+    fn render_event(&mut self, value: &Value) -> Vec<String> {
+        let Some(event_type) = value.get("type").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+
+        match event_type {
+            "thread.started" => Vec::new(),
+            "user_message" => render_user_message(value),
+            "item.completed" => self.render_item_completed(value),
+            "turn.completed" => self.render_turn_completed(value),
+            "turn.failed" => value
+                .get("error")
+                .and_then(|err| err.get("message"))
+                .and_then(Value::as_str)
+                .map(|msg| vec![format!("ERROR: {msg}")])
+                .unwrap_or_else(|| vec!["ERROR: turn failed".to_string()]),
+            "stderr" => value
+                .get("message")
+                .and_then(Value::as_str)
+                .map(|msg| vec![format!("[stderr] {msg}")])
+                .unwrap_or_default(),
+            "error" => value
+                .get("message")
+                .and_then(Value::as_str)
+                .map(|msg| vec![format!("ERROR: {msg}")])
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn render_item_completed(&mut self, value: &Value) -> Vec<String> {
+        let item = match value.get("item") {
+            Some(item) => item,
+            None => return Vec::new(),
+        };
+
+        let item_type = match item.get("type").and_then(Value::as_str) {
+            Some(kind) => kind,
+            None => return Vec::new(),
+        };
+
+        match item_type {
+            "agent_message" => item
+                .get("text")
+                .and_then(Value::as_str)
+                .map(|text| {
+                    let trimmed = text.trim_end().to_string();
+                    self.last_agent_message = Some(trimmed.clone());
+                    vec!["codex".to_string(), trimmed]
+                })
+                .unwrap_or_default(),
+            "reasoning" => item
+                .get("text")
+                .and_then(Value::as_str)
+                .map(|text| {
+                    let mut lines = vec!["thinking".to_string()];
+                    lines.push(text.trim_end().to_string());
+                    lines.push(String::new());
+                    lines
+                })
+                .unwrap_or_default(),
+            "command_execution" => {
+                let command = item
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                let exit_code = item
+                    .get("exit_code")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default();
+                let status = item
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("completed");
+
+                let mut lines = vec!["exec".to_string()];
+                lines.push(command.to_string());
+                let status_line = if exit_code == 0 {
+                    format!("succeeded (exit {exit_code})")
+                } else {
+                    format!("exited {exit_code} ({status})")
+                };
+                lines.push(status_line);
+                if let Some(output) = item
+                    .get("aggregated_output")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    for line in output.lines() {
+                        lines.push(line.to_string());
+                    }
+                }
+                lines
+            }
+            "file_change" => render_file_change_item(item),
+            "web_search" => item
+                .get("query")
+                .and_then(Value::as_str)
+                .map(|query| vec![format!("🌐 Searched: {query}")])
+                .unwrap_or_default(),
+            "mcp_tool_call" => {
+                let server = item
+                    .get("server")
+                    .and_then(Value::as_str)
+                    .unwrap_or("server");
+                let tool = item.get("tool").and_then(Value::as_str).unwrap_or("tool");
+                let status = item
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("completed");
+                vec![format!("tool {server}.{tool} {status}")]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn render_turn_completed(&mut self, value: &Value) -> Vec<String> {
+        let usage = match value.get("usage") {
+            Some(u) => u,
+            None => return Vec::new(),
+        };
+
+        let total = usage
+            .get("total_tokens")
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                usage
+                    .get("total_token_usage")
+                    .and_then(|v| v.get("blended_total"))
+                    .and_then(Value::as_u64)
+            })
+            .unwrap_or_else(|| {
+                let input = usage
+                    .get("input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                let cached = usage
+                    .get("cached_input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                let output = usage
+                    .get("output_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                input.saturating_sub(cached) + output
+            });
+
+        let mut lines = vec!["tokens used".to_string(), format_with_separators(total)];
+        if let Some(message) = self.last_agent_message.clone() {
+            lines.push(message);
+        }
+        lines
+    }
+}
+
+fn render_user_message(value: &Value) -> Vec<String> {
+    let message = value
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if message.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    lines.push("user".to_string());
+    for line in message.lines() {
+        lines.push(line.to_string());
+    }
+    lines.push(String::new());
+    lines
+}
+
+fn render_file_change_item(item: &Value) -> Vec<String> {
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+    let mut lines = vec![format!("file update ({status})")];
+
+    if let Some(changes) = item.get("changes").and_then(Value::as_array) {
+        for change in changes {
+            let path = change
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>");
+            let kind = change
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("update");
+            let marker = match kind {
+                "add" => 'A',
+                "delete" => 'D',
+                "update" => 'M',
+                _ => '?',
+            };
+            lines.push(format!("{marker} {path}"));
+        }
+    }
+
+    lines
 }
 
 #[derive(Clone)]

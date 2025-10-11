@@ -4,7 +4,8 @@ use std::io;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde_json::Value;
+use codex_core::protocol::InputMessageKind;
+use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use tokio::fs::OpenOptions as TokioOpenOptions;
 use tokio::io::{self as tokio_io, AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
@@ -16,7 +17,6 @@ use crate::task::{TaskId, TaskMetadata, TaskState};
 pub const TITLE_ENV_VAR: &str = "CODEX_TASK_TITLE";
 pub const PROMPT_ENV_VAR: &str = "CODEX_TASK_PROMPT";
 pub const EXIT_AFTER_START_ENV_VAR: &str = "CODEX_TASKS_EXIT_AFTER_START";
-const STDERR_PREFIX: &str = "[stderr]";
 
 #[derive(Clone, Debug)]
 pub struct WorkerConfig {
@@ -160,11 +160,23 @@ impl Worker {
     }
 
     async fn run_invocation(&mut self, prompt: String, kind: InvocationKind) -> Result<()> {
-        let mut buffered_log: Vec<String> = Vec::new();
+        let mut buffered_events: Vec<String> = Vec::new();
         let mut pending_pid: Option<i32> = None;
+        let mut pending_prompt: Option<String> = None;
+
+        if let Some(event) = user_message_event(&prompt) {
+            if let Some(session) = self.session.as_mut() {
+                session.write_event_line(&event).await?;
+            } else {
+                buffered_events.push(event);
+            }
+        }
+
+        if self.session.is_none() && !prompt.trim().is_empty() {
+            pending_prompt = Some(prompt.clone());
+        }
 
         if let Some(session) = self.session.as_mut() {
-            session.record_user_prompt(&prompt).await?;
             session
                 .paths
                 .update_metadata(|metadata| {
@@ -172,8 +184,6 @@ impl Worker {
                     metadata.last_prompt = Some(prompt.clone());
                 })
                 .context("failed to update metadata before invocation")?;
-        } else {
-            buffered_log.push(format!("USER: {}", prompt.trim()));
         }
 
         let result_file = NamedTempFile::new_in(&self.config.store_root)
@@ -248,35 +258,43 @@ impl Worker {
 
         loop {
             tokio::select! {
-                        line = stdout_lines.next_line(), if !stdout_done => {
-                            match line {
-                                Ok(Some(content)) => {
+                line = stdout_lines.next_line(), if !stdout_done => {
+                    match line {
+                        Ok(Some(content)) => {
                                     self.handle_stdout_line(
-                                        &prompt,
-                                        &mut buffered_log,
-                &mut pending_pid,
-                &content,
-            ).await?;
-                                }
-                            Ok(None) => stdout_done = true,
-                            Err(err) => return Err(err).context("failed to read stdout from `codex exec`"),
+                                        &mut buffered_events,
+                                        &mut pending_pid,
+                                        &mut pending_prompt,
+                                        &content,
+                                    ).await?;
                         }
-                    }
-                    line = stderr_lines.next_line(), if !stderr_done => {
-                            match line {
-                                Ok(Some(content)) => {
-                                    self.write_log_line(format!("{STDERR_PREFIX} {content}").as_str()).await?;
-                                }
-                                Ok(None) => stderr_done = true,
-                                Err(err) => return Err(err).context("failed to read stderr from `codex exec`"),
+                    Ok(None) => stdout_done = true,
+                    Err(err) => return Err(err).context("failed to read stdout from `codex exec`"),
+                }
+            }
+            line = stderr_lines.next_line(), if !stderr_done => {
+                    match line {
+                        Ok(Some(content)) => {
+                            let stderr_event = serde_json::json!({
+                                "type": "stderr",
+                                "message": content,
+                            }).to_string();
+                            if let Some(session) = self.session.as_mut() {
+                                session.write_event_line(&stderr_event).await?;
+                            } else {
+                                buffered_events.push(stderr_event);
                             }
                         }
-                        else => {
-                            if stdout_done && stderr_done {
-                                break;
-                            }
-                        }
+                        Ok(None) => stderr_done = true,
+                        Err(err) => return Err(err).context("failed to read stderr from `codex exec`"),
                     }
+                }
+                else => {
+                    if stdout_done && stderr_done {
+                        break;
+                    }
+                }
+            }
         }
 
         let status = wait_handle
@@ -312,28 +330,26 @@ impl Worker {
 
     async fn handle_stdout_line(
         &mut self,
-        prompt: &str,
-        buffered_log: &mut Vec<String>,
+        buffered_events: &mut Vec<String>,
         pending_pid: &mut Option<i32>,
+        pending_prompt: &mut Option<String>,
         line: &str,
     ) -> Result<()> {
-        if self.session.is_none() {
-            if let Some(thread_id) = extract_thread_id(line) {
-                self.initialize_session(thread_id, prompt, buffered_log, pending_pid)
-                    .await?;
-                return Ok(());
-            }
-        }
+        let value: Value = match serde_json::from_str(line) {
+            Ok(val) => val,
+            Err(_) => return Ok(()),
+        };
 
-        if self.session.is_none() {
-            if let Some(rendered) = render_event(line) {
-                buffered_log.push(rendered);
-            }
+        if let Some(session) = self.session.as_mut() {
+            session.write_event_line(line).await?;
             return Ok(());
         }
 
-        if let Some(rendered) = render_event(line) {
-            self.write_log_line(&rendered).await?;
+        buffered_events.push(line.to_string());
+
+        if let Some(thread_id) = extract_thread_id(&value) {
+            self.initialize_session(thread_id, buffered_events, pending_pid, pending_prompt)
+                .await?;
         }
 
         Ok(())
@@ -342,9 +358,9 @@ impl Worker {
     async fn initialize_session(
         &mut self,
         thread_id: TaskId,
-        prompt: &str,
-        buffered_log: &mut Vec<String>,
+        buffered_events: &mut Vec<String>,
         pending_pid: &mut Option<i32>,
+        pending_prompt: &mut Option<String>,
     ) -> Result<()> {
         let paths = self.store.task(thread_id.clone());
         paths.ensure_directory()?;
@@ -357,8 +373,10 @@ impl Worker {
                 self.config.title.clone(),
                 TaskState::Running,
             );
-            meta.initial_prompt = Some(prompt.to_string());
-            meta.last_prompt = Some(prompt.to_string());
+            if let Some(prompt_text) = pending_prompt.as_ref() {
+                meta.initial_prompt = Some(prompt_text.clone());
+                meta.last_prompt = Some(prompt_text.clone());
+            }
             meta
         };
         metadata.set_state(TaskState::Running);
@@ -376,6 +394,9 @@ impl Worker {
                 .as_ref()
                 .map(|dir| dir.to_string_lossy().to_string());
         }
+        if let Some(prompt_text) = pending_prompt.as_ref() {
+            metadata.last_prompt = Some(prompt_text.clone());
+        }
         self.store.save_metadata(&metadata)?;
 
         let log_file = TokioOpenOptions::new()
@@ -386,8 +407,8 @@ impl Worker {
             .with_context(|| format!("failed to open log file for task {}", thread_id))?;
         let mut session = ActiveSession::new(thread_id.clone(), paths, log_file);
 
-        for line in buffered_log.drain(..) {
-            session.write_line(&line).await?;
+        for line in buffered_events.drain(..) {
+            session.write_event_line(&line).await?;
         }
 
         if let Some(pid) = pending_pid.take() {
@@ -399,14 +420,8 @@ impl Worker {
             eprintln!("failed to flush worker handshake: {err:#}");
         }
 
+        *pending_prompt = None;
         self.session = Some(session);
-        Ok(())
-    }
-
-    async fn write_log_line(&mut self, line: &str) -> Result<()> {
-        if let Some(session) = self.session.as_mut() {
-            session.write_line(line).await?;
-        }
         Ok(())
     }
 
@@ -448,17 +463,10 @@ impl ActiveSession {
         Self::new(thread_id, paths, log)
     }
 
-    async fn write_line(&mut self, line: &str) -> io::Result<()> {
+    async fn write_event_line(&mut self, line: &str) -> io::Result<()> {
         self.log.write_all(line.as_bytes()).await?;
         self.log.write_all(b"\n").await?;
-        Ok(())
-    }
-
-    async fn record_user_prompt(&mut self, prompt: &str) -> io::Result<()> {
-        if !prompt.trim().is_empty() {
-            self.write_line(&format!("USER: {}", prompt.trim())).await?;
-        }
-        Ok(())
+        self.log.flush().await
     }
 
     async fn record_last_result(&mut self, message: &str) -> Result<()> {
@@ -473,38 +481,31 @@ impl ActiveSession {
     }
 }
 
-fn extract_thread_id(line: &str) -> Option<TaskId> {
-    let value: Value = serde_json::from_str(line).ok()?;
+fn extract_thread_id(value: &Value) -> Option<TaskId> {
     match value.get("type")?.as_str()? {
         "thread.started" => value.get("thread_id")?.as_str().map(|s| s.to_string()),
         _ => None,
     }
 }
 
-fn render_event(line: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(line).ok()?;
-    let event_type = value.get("type")?.as_str()?;
-    match event_type {
-        "item.completed" => {
-            let item = value.get("item")?;
-            let item_type = item.get("type")?.as_str().unwrap_or_default();
-            let text = item.get("text").and_then(Value::as_str).unwrap_or_default();
-            match item_type {
-                "agent_message" => Some(format!("ASSISTANT: {}", text.trim())),
-                "reasoning" => Some(format!("ASSISTANT (reasoning): {}", text.trim())),
-                _ => Some(format!("EVENT {}: {}", item_type, text.trim())),
-            }
-        }
-        "turn.completed" => Some("ASSISTANT: <end>".to_string()),
-        "error" => {
-            let message = value
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            Some(format!("ERROR: {}", message))
-        }
-        _ => None,
+fn user_message_event(prompt: &str) -> Option<String> {
+    if prompt.trim().is_empty() {
+        return None;
     }
+
+    let mut value = json!({
+        "type": "user_message",
+        "message": prompt,
+    });
+
+    let kind = InputMessageKind::from(("user", prompt));
+    if !matches!(kind, InputMessageKind::Plain) {
+        if let Ok(kind_value) = serde_json::to_value(kind) {
+            value["kind"] = kind_value;
+        }
+    }
+
+    Some(value.to_string())
 }
 
 enum InvocationKind {

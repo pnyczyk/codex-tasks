@@ -94,6 +94,9 @@ pub struct LogArgs {
     /// Only print the last N lines before optionally following.
     #[arg(short = 'n', long)]
     pub lines: Option<usize>,
+    /// Emit raw JSONL events instead of human-readable output.
+    #[arg(long = "json")]
+    pub json: bool,
     /// Identifier of the task whose log should be streamed.
     pub task_id: String,
 }
