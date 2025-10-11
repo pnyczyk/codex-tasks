@@ -14,7 +14,7 @@
 codex-tasks start [-t <title>] [--config-file <PATH>] [--working-dir <DIR>] [--repo <URL>] [--repo-ref <REF>] [prompt]
 codex-tasks send <task_id> <prompt>
 codex-tasks status <task_id>
-codex-tasks log [-f] [-n <lines>] <task_id>
+codex-tasks log [--json] [-f] [-n <lines>] <task_id>
 codex-tasks stop <task_id>
 codex-tasks ls [--state <STATE> ...]
 codex-tasks archive <task_id>
@@ -27,7 +27,7 @@ codex-tasks archive <task_id>
   - If an initial prompt is provided, send it immediately.
 - Optional inputs that tailor worker launch:
   - `--config-file PATH`: load a custom `config.toml` for Codex with the path’s parent treated as `CODEX_HOME`.
-  - `--working-dir DIR`: run `codex proto` from this directory (created if missing, unless repo cloning is requested).
+  - `--working-dir DIR`: run `codex proto` from this directory (created if missing, unless repo cloning is requested). If omitted, the worker inherits the CLI's current directory and the value is recorded in task metadata for future `send` calls.
   - `--repo URL`: clone the Git repository into the parent of `DIR` and use the directory name as the clone target (requires `--working-dir`).
   - `--repo-ref REF`: checkout the named branch/tag/commit after cloning.
 - Return `task_id` to stdout.
@@ -42,8 +42,8 @@ codex-tasks archive <task_id>
 - Output JSON or table with status, title (if any), timestamps, and last result (if available).
 
 ### 3.4 `log`
-- Stream the rendered transcript from `<task_id>.log`.
-- `-f/--follow` streams until the worker returns to `IDLE` (or reaches a terminal state), exiting automatically afterwards.
+- Stream the transcript from `<task_id>.log`. By default the CLI renders human-friendly output matching `codex exec`; `--json` streams raw JSONL events.
+- `-f/--follow` streams until the worker returns to `IDLE` (or reaches a terminal state), exiting automatically afterwards. Combine with `--forever`/`-F` to continue streaming indefinitely.
 - `--forever`/`-F` implies `--follow` and retains the original "tail indefinitely" behavior for users who want to keep the stream open.
 - `-n/--lines <N>` restricts the initial dump to the last *N* lines before optionally following.
 - Intended as the primary observability tool without attaching a TTY to the worker.
@@ -70,6 +70,7 @@ codex-tasks archive <task_id>
 - `created_at`, `updated_at` timestamps (recorded by worker).
 - `last_result`: UTF-8 text of the most recent Codex answer (available in `IDLE`, `STOPPED`, `ARCHIVED`).
 - `last_prompt`: UTF-8 text of the most recent user prompt (updated on `start` and each `send`).
+- `working_dir`: absolute path used when launching Codex; defaults to the CLI's current directory if `--working-dir` was not provided.
 
 ## 5. Filesystem layout (`~/.codex/tasks/`)
 - Active tasks live under `~/.codex/tasks/<task_id>/`, keeping related files grouped together.
@@ -87,7 +88,7 @@ codex-tasks archive <task_id>
   archive/<YYYY>/<MM>/<DD>/<task_id>/...
 ```
 - When a task is STOPPED or DIED, `.pid` and `.pipe` are removed; log/result remain.
-- LOG format matches current `codex-task` output (timestamps, headings, reasoning blocks, etc.).
+- `task.log` contains a JSON Lines stream of Codex events (`thread.started`, `turn.completed`, `item.completed`, etc.) including synthetic `user_message` entries for prompts and `stderr` entries for diagnostics. CLI rendering converts this stream into the familiar human transcript.
 
 ## 6. Worker lifecycle
 1. **Spawn**: parent CLI forks a worker, writes initial files, and returns `task_id`.

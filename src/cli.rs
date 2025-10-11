@@ -60,7 +60,7 @@ pub struct StartArgs {
     #[arg(long = "repo-ref", value_name = "REF")]
     pub repo_ref: Option<String>,
     /// Initial prompt to send immediately after the worker launches.
-    pub prompt: Option<String>,
+    pub prompt: String,
 }
 
 /// Arguments for the `send` subcommand.
@@ -88,12 +88,15 @@ pub struct LogArgs {
     /// Follow the log output until interrupted.
     #[arg(short = 'f', long)]
     pub follow: bool,
-    /// Continue following even after the worker becomes idle.
+    /// Continue following even after the worker stops running.
     #[arg(short = 'F', long = "forever")]
     pub forever: bool,
     /// Only print the last N lines before optionally following.
     #[arg(short = 'n', long)]
     pub lines: Option<usize>,
+    /// Emit raw JSONL events instead of human-readable output.
+    #[arg(long = "json")]
+    pub json: bool,
     /// Identifier of the task whose log should be streamed.
     pub task_id: String,
 }
@@ -101,7 +104,7 @@ pub struct LogArgs {
 /// Arguments for the `stop` subcommand.
 #[derive(Debug, Args)]
 pub struct StopArgs {
-    /// Stop every idle task instead of targeting a specific identifier.
+    /// Stop every running task instead of targeting a specific identifier.
     #[arg(short = 'a', long = "all")]
     pub all: bool,
     /// Identifier of the task that should be stopped.
@@ -138,16 +141,16 @@ pub struct ArchiveArgs {
 /// Hidden arguments used when the CLI binary is re-executed as a worker.
 #[derive(Debug, Args)]
 pub struct WorkerArgs {
-    /// Identifier associated with the task managed by this worker.
-    #[arg(long = "task-id")]
-    pub task_id: String,
     /// Filesystem root containing task artifacts.
     #[arg(long = "store-root")]
     pub store_root: PathBuf,
+    /// Optional existing task identifier (Codex thread_id) to resume.
+    #[arg(long = "task-id")]
+    pub task_id: Option<String>,
     /// Optional task title (primarily used for diagnostics).
     #[arg(long)]
     pub title: Option<String>,
-    /// Optional prompt to send once the worker is fully initialized.
+    /// Prompt to send to the worker.
     #[arg(long)]
     pub prompt: Option<String>,
     /// Optional Codex config file that should override the default configuration.

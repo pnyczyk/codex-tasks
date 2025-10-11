@@ -1,558 +1,514 @@
-use std::convert::TryFrom;
 use std::env;
-use std::ffi::CString;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::io;
+use std::path::PathBuf;
 
-use anyhow::{Context, Result, anyhow};
-use codex_core::config::{Config, ConfigOverrides, ConfigToml};
-use codex_core::protocol::{Event, EventMsg};
+use anyhow::{Context, Result, anyhow, bail};
+use codex_core::protocol::InputMessageKind;
+use serde_json::{Value, json};
+use tempfile::NamedTempFile;
 use tokio::fs::OpenOptions as TokioOpenOptions;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::mpsc;
+use tokio::io::{self as tokio_io, AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::process::Command;
 
 use crate::storage::{TaskPaths, TaskStore};
-use crate::task::{TaskId, TaskState};
-use crate::worker::event_processor::{CodexStatus, EventProcessor};
-use crate::worker::event_processor_with_human_output::EventProcessorWithHumanOutput;
-use crate::worker::runner::{self, ProtoLaunchOptions};
+use crate::task::{TaskId, TaskMetadata, TaskState};
 
-/// Environment variable that carries the optional title for the worker.
 pub const TITLE_ENV_VAR: &str = "CODEX_TASK_TITLE";
-/// Environment variable that carries the initial prompt for the worker.
 pub const PROMPT_ENV_VAR: &str = "CODEX_TASK_PROMPT";
-/// When set, the worker will exit immediately after it records its PID.
 pub const EXIT_AFTER_START_ENV_VAR: &str = "CODEX_TASKS_EXIT_AFTER_START";
 
-/// Configuration assembled from CLI arguments and environment variables for a worker.
 #[derive(Clone, Debug)]
 pub struct WorkerConfig {
-    pub task_id: TaskId,
     pub store_root: PathBuf,
+    pub task_id: Option<TaskId>,
     pub title: Option<String>,
-    pub initial_prompt: Option<String>,
+    pub prompt: String,
     pub config_path: Option<PathBuf>,
     pub working_dir: Option<PathBuf>,
 }
 
 impl WorkerConfig {
-    /// Builds a configuration for the worker, preferring explicit CLI values and
-    /// falling back to environment variables when they are absent.
     pub fn new(
-        task_id: TaskId,
         store_root: PathBuf,
+        task_id: Option<String>,
         title: Option<String>,
-        initial_prompt: Option<String>,
+        prompt: Option<String>,
         config_path: Option<PathBuf>,
         working_dir: Option<PathBuf>,
     ) -> Result<Self> {
         let title = title.or_else(|| env::var(TITLE_ENV_VAR).ok());
-        let initial_prompt = initial_prompt.or_else(|| env::var(PROMPT_ENV_VAR).ok());
-        let config_path =
-            match config_path {
-                Some(path) => Some(path.canonicalize().with_context(|| {
-                    format!("failed to resolve config file at {}", path.display())
-                })?),
-                None => None,
-            };
-        let working_dir = match working_dir {
-            Some(path) => Some(path.canonicalize().with_context(|| {
-                format!("failed to resolve working directory {}", path.display())
-            })?),
-            None => None,
-        };
+        let prompt = prompt
+            .or_else(|| env::var(PROMPT_ENV_VAR).ok())
+            .ok_or_else(|| anyhow!("prompt is required when launching a worker"))?;
+        if prompt.trim().is_empty() {
+            bail!("prompt must not be empty");
+        }
+
+        let config_path = canonicalize_optional(config_path)
+            .context("failed to resolve config path for worker")?;
+        let working_dir = canonicalize_optional(working_dir)
+            .context("failed to resolve working directory for worker")?;
+
         Ok(Self {
-            task_id,
             store_root,
+            task_id,
             title,
-            initial_prompt,
+            prompt,
             config_path,
             working_dir,
         })
     }
 
-    /// Returns a [`TaskStore`] rooted at the configured location.
     pub fn store(&self) -> TaskStore {
         TaskStore::new(self.store_root.clone())
     }
 
-    /// Returns helpers that operate on files for this task.
-    pub fn task_paths(&self) -> TaskPaths {
-        self.store().task(self.task_id.clone())
+    pub fn codex_home_override(&self) -> Result<Option<PathBuf>> {
+        match &self.config_path {
+            Some(path) => {
+                let parent = path.parent().ok_or_else(|| {
+                    anyhow!(
+                        "config file {} does not have a parent directory",
+                        path.display()
+                    )
+                })?;
+                Ok(Some(parent.to_path_buf()))
+            }
+            None => Ok(None),
+        }
     }
 }
 
-/// Runs the worker process until it is signalled to exit.
+fn canonicalize_optional(path: Option<PathBuf>) -> Result<Option<PathBuf>> {
+    match path {
+        Some(p) => {
+            Ok(Some(p.canonicalize().with_context(|| {
+                format!("failed to canonicalize {}", p.display())
+            })?))
+        }
+        None => Ok(None),
+    }
+}
+
 pub async fn run_worker(config: WorkerConfig) -> Result<()> {
-    let worker_config = config;
-    let store = worker_config.store();
-    store.ensure_layout()?;
-    let paths = store.task(worker_config.task_id.clone());
-    paths.ensure_directory()?;
-
-    let pid = std::process::id();
-    let pid = i32::try_from(pid).context("worker process id exceeds i32 range")?;
-    paths
-        .write_pid(pid)
-        .context("failed to persist worker pid file")?;
-
-    if should_exit_after_start() {
+    if env::var(EXIT_AFTER_START_ENV_VAR).is_ok() {
         return Ok(());
     }
 
-    let pipe_path = paths.pipe_path();
-    create_pipe(&pipe_path)
-        .with_context(|| format!("failed to create prompt pipe at {}", pipe_path.display()))?;
+    let worker = Worker::initialize(config).await?;
+    worker.run().await
+}
 
-    let log_path = paths.log_path();
-    let log_file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&log_path)
-        .with_context(|| format!("failed to open log file at {}", log_path.display()))?;
+struct Worker {
+    config: WorkerConfig,
+    store: TaskStore,
+    session: Option<ActiveSession>,
+}
 
-    redirect_stdio_to(&log_file).context("failed to redirect worker output to log file")?;
+impl Worker {
+    async fn initialize(mut config: WorkerConfig) -> Result<Self> {
+        let store = config.store();
+        store.ensure_layout()?;
 
-    let (codex_config, codex_home_override) =
-        load_codex_config(worker_config.config_path.as_deref())?;
-
-    let event_processor = EventProcessorWithHumanOutput::create_with_ansi(
-        false,
-        &codex_config,
-        Some(paths.result_path()),
-    );
-    let mut event_processor = MetadataAwareProcessor::new(event_processor, paths.clone());
-
-    let proto_options = ProtoLaunchOptions {
-        working_dir: worker_config.working_dir.clone(),
-        config_home: codex_home_override.clone(),
-    };
-
-    let runner::ChildHandles {
-        child,
-        stdout,
-        stdin,
-    } = runner::spawn_codex_proto(&proto_options).await?;
-
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Event>();
-    tokio::spawn(async move {
-        let mut lines = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
+        let session = if let Some(task_id) = &config.task_id {
+            let paths = store.task(task_id.clone());
+            if !paths.metadata_path().exists() {
+                bail!("task {task_id} was not found");
             }
-            match serde_json::from_str::<Event>(trimmed) {
-                Ok(event) => {
-                    if event_tx.send(event).is_err() {
+            let metadata = paths.read_metadata()?;
+            if config.config_path.is_none() {
+                config.config_path = metadata.config_path.as_ref().map(PathBuf::from);
+            }
+            if config.working_dir.is_none() {
+                config.working_dir = metadata.working_dir.as_ref().map(PathBuf::from);
+            }
+
+            let log_file = TokioOpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(paths.log_path())
+                .await
+                .with_context(|| format!("failed to open log file for task {task_id}"))?;
+            Some(ActiveSession::from_existing(
+                task_id.clone(),
+                paths,
+                log_file,
+            ))
+        } else {
+            None
+        };
+
+        Ok(Self {
+            config,
+            store,
+            session,
+        })
+    }
+
+    async fn run(mut self) -> Result<()> {
+        let initial = self.session.is_none();
+        let prompt = self.config.prompt.clone();
+        let request = if initial {
+            InvocationKind::Initial
+        } else {
+            InvocationKind::Resume
+        };
+
+        self.run_invocation(prompt, request).await?;
+        self.finalize().await
+    }
+
+    async fn run_invocation(&mut self, prompt: String, kind: InvocationKind) -> Result<()> {
+        let mut buffered_events: Vec<String> = Vec::new();
+        let mut pending_pid: Option<i32> = None;
+        let mut pending_prompt: Option<String> = None;
+
+        if let Some(event) = user_message_event(&prompt) {
+            if let Some(session) = self.session.as_mut() {
+                session.write_event_line(&event).await?;
+            } else {
+                buffered_events.push(event);
+            }
+        }
+
+        if self.session.is_none() && !prompt.trim().is_empty() {
+            pending_prompt = Some(prompt.clone());
+        }
+
+        if let Some(session) = self.session.as_mut() {
+            session
+                .paths
+                .update_metadata(|metadata| {
+                    metadata.set_state(TaskState::Running);
+                    metadata.last_prompt = Some(prompt.clone());
+                })
+                .context("failed to update metadata before invocation")?;
+        }
+
+        let result_file = NamedTempFile::new_in(&self.config.store_root)
+            .context("failed to create temporary result file")?;
+        let result_path = result_file.into_temp_path();
+
+        let codex_home = self.config.codex_home_override()?;
+        let mut command = Command::new("codex");
+        command.arg("exec");
+        command.arg("--json");
+        command.arg("--output-last-message");
+        command.arg(&result_path);
+
+        if let Some(dir) = &self.config.working_dir {
+            command.arg("--cd");
+            command.arg(dir);
+        }
+        if let Some(home) = &codex_home {
+            command.env("CODEX_HOME", home);
+        }
+
+        match (&self.session, kind) {
+            (None, InvocationKind::Initial) => {
+                command.arg(&prompt);
+            }
+            (Some(session), InvocationKind::Resume) => {
+                command.arg("resume");
+                command.arg(&session.thread_id);
+                command.arg(&prompt);
+            }
+            (None, InvocationKind::Resume) => {
+                bail!("cannot resume without an existing task id");
+            }
+            (Some(_), InvocationKind::Initial) => {
+                bail!("initial invocation already performed");
+            }
+        }
+
+        command.stdin(std::process::Stdio::piped());
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
+
+        let mut child = command.spawn().context("failed to spawn `codex exec`")?;
+        let child_pid = child
+            .id()
+            .ok_or_else(|| anyhow!("failed to determine child pid"))?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .context("failed to capture stdout of `codex exec`")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("failed to capture stderr of `codex exec`")?;
+
+        if let Some(session) = self.session.as_mut() {
+            session.paths.write_pid(child_pid as i32)?;
+            session
+                .paths
+                .update_metadata(|metadata| metadata.set_state(TaskState::Running))?;
+        } else {
+            pending_pid = Some(child_pid as i32);
+        }
+
+        let mut stdout_lines = BufReader::new(stdout).lines();
+        let mut stderr_lines = BufReader::new(stderr).lines();
+        let wait_handle = tokio::spawn(async move { child.wait().await });
+
+        let mut stdout_done = false;
+        let mut stderr_done = false;
+
+        loop {
+            tokio::select! {
+                line = stdout_lines.next_line(), if !stdout_done => {
+                    match line {
+                        Ok(Some(content)) => {
+                                    self.handle_stdout_line(
+                                        &mut buffered_events,
+                                        &mut pending_pid,
+                                        &mut pending_prompt,
+                                        &content,
+                                    ).await?;
+                        }
+                    Ok(None) => stdout_done = true,
+                    Err(err) => return Err(err).context("failed to read stdout from `codex exec`"),
+                }
+            }
+            line = stderr_lines.next_line(), if !stderr_done => {
+                    match line {
+                        Ok(Some(content)) => {
+                            let stderr_event = serde_json::json!({
+                                "type": "stderr",
+                                "message": content,
+                            }).to_string();
+                            if let Some(session) = self.session.as_mut() {
+                                session.write_event_line(&stderr_event).await?;
+                            } else {
+                                buffered_events.push(stderr_event);
+                            }
+                        }
+                        Ok(None) => stderr_done = true,
+                        Err(err) => return Err(err).context("failed to read stderr from `codex exec`"),
+                    }
+                }
+                else => {
+                    if stdout_done && stderr_done {
                         break;
                     }
                 }
-                Err(err) => {
-                    eprintln!("Failed to parse event from codex proto: {err}");
-                }
             }
         }
+
+        let status = wait_handle
+            .await
+            .context("failed to join exec child task")?
+            .context("`codex exec` terminated unexpectedly")?;
+
+        if status.success() {
+            if let Some(session) = self.session.as_mut() {
+                session
+                    .paths
+                    .update_metadata(|metadata| metadata.set_state(TaskState::Stopped))?;
+            }
+        } else if let Some(session) = self.session.as_mut() {
+            session
+                .paths
+                .update_metadata(|metadata| metadata.set_state(TaskState::Died))?;
+        }
+
+        if result_path.exists() {
+            let message =
+                fs::read_to_string(&result_path).context("failed to read result output")?;
+            if let Some(session) = self.session.as_mut() {
+                session.record_last_result(&message).await?;
+            }
+            result_path
+                .close()
+                .context("failed to remove temporary result file")?;
+        }
+
+        Ok(())
+    }
+
+    async fn handle_stdout_line(
+        &mut self,
+        buffered_events: &mut Vec<String>,
+        pending_pid: &mut Option<i32>,
+        pending_prompt: &mut Option<String>,
+        line: &str,
+    ) -> Result<()> {
+        let value: Value = match serde_json::from_str(line) {
+            Ok(val) => val,
+            Err(_) => return Ok(()),
+        };
+
+        if let Some(session) = self.session.as_mut() {
+            session.write_event_line(line).await?;
+            return Ok(());
+        }
+
+        buffered_events.push(line.to_string());
+
+        if let Some(thread_id) = extract_thread_id(&value) {
+            self.initialize_session(thread_id, buffered_events, pending_pid, pending_prompt)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn initialize_session(
+        &mut self,
+        thread_id: TaskId,
+        buffered_events: &mut Vec<String>,
+        pending_pid: &mut Option<i32>,
+        pending_prompt: &mut Option<String>,
+    ) -> Result<()> {
+        let paths = self.store.task(thread_id.clone());
+        paths.ensure_directory()?;
+
+        let mut metadata = if paths.metadata_path().exists() {
+            paths.read_metadata()?
+        } else {
+            let mut meta = TaskMetadata::new(
+                thread_id.clone(),
+                self.config.title.clone(),
+                TaskState::Running,
+            );
+            if let Some(prompt_text) = pending_prompt.as_ref() {
+                meta.initial_prompt = Some(prompt_text.clone());
+                meta.last_prompt = Some(prompt_text.clone());
+            }
+            meta
+        };
+        metadata.set_state(TaskState::Running);
+        if metadata.config_path.is_none() {
+            metadata.config_path = self
+                .config
+                .config_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_string());
+        }
+        if metadata.working_dir.is_none() {
+            metadata.working_dir = self
+                .config
+                .working_dir
+                .as_ref()
+                .map(|dir| dir.to_string_lossy().to_string());
+        }
+        if let Some(prompt_text) = pending_prompt.as_ref() {
+            metadata.last_prompt = Some(prompt_text.clone());
+        }
+        self.store.save_metadata(&metadata)?;
+
+        let log_file = TokioOpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(paths.log_path())
+            .await
+            .with_context(|| format!("failed to open log file for task {}", thread_id))?;
+        let mut session = ActiveSession::new(thread_id.clone(), paths, log_file);
+
+        for line in buffered_events.drain(..) {
+            session.write_event_line(&line).await?;
+        }
+
+        if let Some(pid) = pending_pid.take() {
+            session.paths.write_pid(pid)?;
+        }
+
+        println!("{thread_id}");
+        if let Err(err) = tokio_io::stdout().flush().await {
+            eprintln!("failed to flush worker handshake: {err:#}");
+        }
+
+        *pending_prompt = None;
+        self.session = Some(session);
+        Ok(())
+    }
+
+    async fn finalize(mut self) -> Result<()> {
+        if let Some(mut session) = self.session.take() {
+            if let Err(err) = session.flush().await {
+                eprintln!(
+                    "failed to flush log for task {}: {err:#}",
+                    session.thread_id
+                );
+            }
+            if let Err(err) = session.paths.remove_pid() {
+                eprintln!(
+                    "failed to remove pid file for task {}: {err:#}",
+                    session.thread_id
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+struct ActiveSession {
+    thread_id: TaskId,
+    paths: TaskPaths,
+    log: BufWriter<tokio::fs::File>,
+}
+
+impl ActiveSession {
+    fn new(thread_id: TaskId, paths: TaskPaths, log: tokio::fs::File) -> Self {
+        Self {
+            thread_id,
+            paths,
+            log: BufWriter::new(log),
+        }
+    }
+
+    fn from_existing(thread_id: TaskId, paths: TaskPaths, log: tokio::fs::File) -> Self {
+        Self::new(thread_id, paths, log)
+    }
+
+    async fn write_event_line(&mut self, line: &str) -> io::Result<()> {
+        self.log.write_all(line.as_bytes()).await?;
+        self.log.write_all(b"\n").await?;
+        self.log.flush().await
+    }
+
+    async fn record_last_result(&mut self, message: &str) -> Result<()> {
+        self.paths.write_last_result(message)?;
+        self.paths
+            .update_metadata(|metadata| metadata.last_result = Some(message.to_string()))?;
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> io::Result<()> {
+        self.log.flush().await
+    }
+}
+
+fn extract_thread_id(value: &Value) -> Option<TaskId> {
+    match value.get("type")?.as_str()? {
+        "thread.started" => value.get("thread_id")?.as_str().map(|s| s.to_string()),
+        _ => None,
+    }
+}
+
+fn user_message_event(prompt: &str) -> Option<String> {
+    if prompt.trim().is_empty() {
+        return None;
+    }
+
+    let mut value = json!({
+        "type": "user_message",
+        "message": prompt,
     });
 
-    let pipe_file = TokioOpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&pipe_path)
-        .await
-        .with_context(|| format!("failed to open prompt pipe at {}", pipe_path.display()))?;
-
-    let result = runner::run_event_loop(
-        child,
-        stdin,
-        &mut event_processor,
-        &codex_config,
-        &mut event_rx,
-        pipe_file,
-        worker_config.initial_prompt.clone(),
-    )
-    .await;
-
-    if let Err(err) = std::io::stdout().flush() {
-        eprintln!("failed to flush worker log: {err:#}");
+    let kind = InputMessageKind::from(("user", prompt));
+    if !matches!(kind, InputMessageKind::Plain) {
+        if let Ok(kind_value) = serde_json::to_value(kind) {
+            value["kind"] = kind_value;
+        }
     }
 
-    if let Err(err) = paths.remove_pipe() {
-        eprintln!("failed to remove pipe for task {}: {err:#}", paths.id());
-    }
-    if let Err(err) = paths.remove_pid() {
-        eprintln!("failed to remove pid file for task {}: {err:#}", paths.id());
-    }
-
-    drop(log_file);
-
-    if let Err(err) = paths.update_metadata(|metadata| metadata.set_state(TaskState::Stopped)) {
-        log_metadata_error(paths.id(), "mark STOPPED after worker exit", err);
-    }
-
-    result
+    Some(value.to_string())
 }
 
-fn load_codex_config(config_path: Option<&Path>) -> Result<(Config, Option<PathBuf>)> {
-    match config_path {
-        Some(path) => {
-            let parent = path.parent().ok_or_else(|| {
-                anyhow!(
-                    "config file {} does not have a parent directory",
-                    path.display()
-                )
-            })?;
-            let contents = fs::read_to_string(path)
-                .with_context(|| format!("failed to read config file at {}", path.display()))?;
-            let cfg: ConfigToml = toml::from_str(&contents)
-                .with_context(|| format!("failed to parse config file at {}", path.display()))?;
-            let config = Config::load_from_base_config_with_overrides(
-                cfg,
-                ConfigOverrides::default(),
-                parent.to_path_buf(),
-            )
-            .with_context(|| {
-                format!(
-                    "failed to build Codex configuration from {}",
-                    path.display()
-                )
-            })?;
-            Ok((config, Some(parent.to_path_buf())))
-        }
-        None => {
-            let config = Config::load_with_cli_overrides(Vec::new(), ConfigOverrides::default())
-                .context("failed to load Codex configuration")?;
-            Ok((config, None))
-        }
-    }
-}
-
-fn should_exit_after_start() -> bool {
-    match env::var(EXIT_AFTER_START_ENV_VAR) {
-        Ok(value) => {
-            let trimmed = value.trim();
-            trimmed.is_empty() || trimmed.eq_ignore_ascii_case("true") || trimmed == "1"
-        }
-        Err(_) => false,
-    }
-}
-
-fn create_pipe(path: &Path) -> Result<()> {
-    if path.exists() {
-        fs::remove_file(path)
-            .with_context(|| format!("failed to remove existing pipe at {}", path.display()))?;
-    }
-
-    let c_path = CString::new(path.as_os_str().as_bytes())
-        .context("pipe path contained interior null bytes")?;
-    let mode = 0o600;
-    let result = unsafe { libc::mkfifo(c_path.as_ptr(), mode) };
-    if result != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("failed to create pipe at {}", path.display()));
-    }
-
-    Ok(())
-}
-
-struct MetadataAwareProcessor<P> {
-    inner: P,
-    task_paths: TaskPaths,
-}
-
-impl<P> MetadataAwareProcessor<P> {
-    fn new(inner: P, task_paths: TaskPaths) -> Self {
-        Self { inner, task_paths }
-    }
-
-    fn update_state(&self, state: TaskState) {
-        if let Err(err) = self
-            .task_paths
-            .update_metadata(|metadata| metadata.set_state(state.clone()))
-        {
-            log_metadata_error(
-                self.task_paths.id(),
-                &format!("update state to {state}"),
-                err,
-            );
-        }
-    }
-
-    fn mark_idle(&self) {
-        let last_result = match self.task_paths.read_last_result() {
-            Ok(contents) => contents,
-            Err(err) => {
-                log_metadata_error(
-                    self.task_paths.id(),
-                    "read last result while marking IDLE",
-                    err,
-                );
-                None
-            }
-        };
-
-        if let Err(err) = self.task_paths.update_metadata(|metadata| {
-            metadata.set_state(TaskState::Idle);
-            metadata.last_result = last_result.clone();
-        }) {
-            log_metadata_error(self.task_paths.id(), "mark IDLE after completion", err);
-        }
-    }
-}
-
-impl<P> EventProcessor for MetadataAwareProcessor<P>
-where
-    P: EventProcessor,
-{
-    fn print_config_summary(&mut self, config: &Config, prompt: &str) {
-        self.inner.print_config_summary(config, prompt);
-    }
-
-    fn print_user_prompt(&mut self, prompt: &str) {
-        if let Err(err) = self.task_paths.update_metadata(|metadata| {
-            metadata.last_prompt = Some(prompt.to_string());
-            metadata.touch();
-        }) {
-            log_metadata_error(self.task_paths.id(), "record last prompt", err);
-        }
-        self.inner.print_user_prompt(prompt);
-    }
-
-    fn process_event(&mut self, event: Event) -> CodexStatus {
-        let message = event.msg.clone();
-        let status = self.inner.process_event(event);
-        match message {
-            EventMsg::TaskStarted(_) => self.update_state(TaskState::Running),
-            EventMsg::TaskComplete(_) => self.mark_idle(),
-            EventMsg::ShutdownComplete => self.update_state(TaskState::Stopped),
-            _ => {}
-        }
-        status
-    }
-}
-
-fn log_metadata_error(task_id: &str, context: &str, err: anyhow::Error) {
-    let not_found = err
-        .downcast_ref::<std::io::Error>()
-        .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound);
-    if !not_found {
-        eprintln!("failed to {context} for task {task_id}: {err:#}");
-    }
-}
-
-fn redirect_stdio_to(log: &std::fs::File) -> Result<()> {
-    let fd = log.as_raw_fd();
-    unsafe {
-        if libc::dup2(fd, libc::STDOUT_FILENO) == -1 {
-            return Err(std::io::Error::last_os_error())
-                .context("failed to redirect stdout to log file");
-        }
-        if libc::dup2(fd, libc::STDERR_FILENO) == -1 {
-            return Err(std::io::Error::last_os_error())
-                .context("failed to redirect stderr to log file");
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::os::unix::fs::FileTypeExt;
-    use std::sync::Mutex;
-
-    use crate::storage::TaskStore;
-    use crate::task::{TaskMetadata, TaskState};
-    use codex_core::protocol::{TaskCompleteEvent, TaskStartedEvent};
-    use tempfile::tempdir;
-
-    static ENV_GUARD: Mutex<()> = Mutex::new(());
-
-    fn set_env(key: &str, value: &str) {
-        // Protected by ENV_GUARD to avoid concurrent mutations.
-        unsafe { env::set_var(key, value) };
-    }
-
-    fn remove_env(key: &str) {
-        unsafe { env::remove_var(key) };
-    }
-
-    struct DummyProcessor;
-
-    impl EventProcessor for DummyProcessor {
-        fn print_config_summary(&mut self, _config: &Config, _prompt: &str) {}
-
-        fn process_event(&mut self, _event: Event) -> CodexStatus {
-            CodexStatus::Running
-        }
-    }
-
-    #[test]
-    fn metadata_aware_processor_marks_running_on_task_started() {
-        let tmp = tempdir().expect("tempdir");
-        let store = TaskStore::new(tmp.path().join("store"));
-        store.ensure_layout().expect("layout");
-        let paths = store.task("task-running".to_string());
-        paths.ensure_directory().expect("directory");
-        let metadata = TaskMetadata::new("task-running".into(), None, TaskState::Idle);
-        paths.write_metadata(&metadata).expect("write metadata");
-
-        let mut processor = MetadataAwareProcessor::new(DummyProcessor, paths.clone());
-        let event = Event {
-            id: "1".into(),
-            msg: EventMsg::TaskStarted(TaskStartedEvent {
-                model_context_window: None,
-            }),
-        };
-        processor.process_event(event);
-
-        let metadata = paths.read_metadata().expect("read metadata");
-        assert_eq!(metadata.state, TaskState::Running);
-    }
-
-    #[test]
-    fn metadata_aware_processor_marks_idle_and_updates_result() {
-        let tmp = tempdir().expect("tempdir");
-        let store = TaskStore::new(tmp.path().join("store"));
-        store.ensure_layout().expect("layout");
-        let paths = store.task("task-complete".to_string());
-        paths.ensure_directory().expect("directory");
-        let metadata = TaskMetadata::new("task-complete".into(), None, TaskState::Running);
-        paths.write_metadata(&metadata).expect("write metadata");
-        paths
-            .write_last_result("final result")
-            .expect("write result");
-
-        let mut processor = MetadataAwareProcessor::new(DummyProcessor, paths.clone());
-        let event = Event {
-            id: "2".into(),
-            msg: EventMsg::TaskComplete(TaskCompleteEvent {
-                last_agent_message: Some("done".into()),
-            }),
-        };
-        processor.process_event(event);
-
-        let metadata = paths.read_metadata().expect("read metadata");
-        assert_eq!(metadata.state, TaskState::Idle);
-        assert_eq!(metadata.last_result.as_deref(), Some("final result"));
-    }
-
-    #[test]
-    fn metadata_aware_processor_marks_stopped_on_shutdown() {
-        let tmp = tempdir().expect("tempdir");
-        let store = TaskStore::new(tmp.path().join("store"));
-        store.ensure_layout().expect("layout");
-        let paths = store.task("task-stop".to_string());
-        paths.ensure_directory().expect("directory");
-        let metadata = TaskMetadata::new("task-stop".into(), None, TaskState::Running);
-        paths.write_metadata(&metadata).expect("write metadata");
-
-        let mut processor = MetadataAwareProcessor::new(DummyProcessor, paths.clone());
-        let event = Event {
-            id: "3".into(),
-            msg: EventMsg::ShutdownComplete,
-        };
-        processor.process_event(event);
-
-        let metadata = paths.read_metadata().expect("read metadata");
-        assert_eq!(metadata.state, TaskState::Stopped);
-    }
-
-    #[test]
-    fn metadata_aware_processor_records_last_prompt() {
-        let tmp = tempdir().expect("tempdir");
-        let store = TaskStore::new(tmp.path().join("store"));
-        store.ensure_layout().expect("layout");
-        let paths = store.task("task-log".to_string());
-        paths.ensure_directory().expect("directory");
-        let metadata = TaskMetadata::new("task-log".into(), None, TaskState::Idle);
-        paths.write_metadata(&metadata).expect("write metadata");
-
-        let mut processor = MetadataAwareProcessor::new(DummyProcessor, paths.clone());
-        processor.print_user_prompt("Follow-up prompt");
-
-        let metadata = paths.read_metadata().expect("read metadata");
-        assert_eq!(metadata.last_prompt.as_deref(), Some("Follow-up prompt"));
-    }
-
-    #[test]
-    fn cli_values_override_environment() {
-        let _guard = ENV_GUARD.lock().expect("lock env");
-        set_env(TITLE_ENV_VAR, "env title");
-        set_env(PROMPT_ENV_VAR, "env prompt");
-        let tmp = tempdir().expect("tempdir");
-        let config = WorkerConfig::new(
-            "task-1".to_string(),
-            tmp.path().to_path_buf(),
-            Some("cli title".to_string()),
-            Some("cli prompt".to_string()),
-            None,
-            None,
-        )
-        .expect("config");
-        assert_eq!(config.title.as_deref(), Some("cli title"));
-        assert_eq!(config.initial_prompt.as_deref(), Some("cli prompt"));
-        remove_env(TITLE_ENV_VAR);
-        remove_env(PROMPT_ENV_VAR);
-    }
-
-    #[test]
-    fn environment_values_fill_missing_fields() {
-        let _guard = ENV_GUARD.lock().expect("lock env");
-        set_env(TITLE_ENV_VAR, "env title");
-        set_env(PROMPT_ENV_VAR, "env prompt");
-        let tmp = tempdir().expect("tempdir");
-        let config = WorkerConfig::new(
-            "task-2".to_string(),
-            tmp.path().to_path_buf(),
-            None,
-            None,
-            None,
-            None,
-        )
-        .expect("config");
-        assert_eq!(config.title.as_deref(), Some("env title"));
-        assert_eq!(config.initial_prompt.as_deref(), Some("env prompt"));
-        remove_env(TITLE_ENV_VAR);
-        remove_env(PROMPT_ENV_VAR);
-    }
-
-    #[test]
-    fn run_worker_writes_pid_file() {
-        let _guard = ENV_GUARD.lock().expect("lock env");
-        set_env(EXIT_AFTER_START_ENV_VAR, "1");
-        let tmp = tempdir().expect("tempdir");
-        let task_id = "task-3".to_string();
-        let store_root = tmp.path().to_path_buf();
-        let config = WorkerConfig::new(task_id.clone(), store_root.clone(), None, None, None, None)
-            .expect("config");
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime")
-            .block_on(run_worker(config))
-            .expect("worker should run");
-
-        let store = TaskStore::new(store_root);
-        let pid_path = store.task(task_id.clone()).pid_path();
-        assert!(pid_path.exists());
-        let contents = fs::read_to_string(pid_path).expect("read pid");
-        let expected = i32::try_from(std::process::id()).expect("pid fits in i32");
-        assert_eq!(contents.trim(), expected.to_string());
-        remove_env(EXIT_AFTER_START_ENV_VAR);
-    }
-
-    #[test]
-    fn create_pipe_creates_fifo() {
-        let tmp = tempdir().expect("tempdir");
-        let path = tmp.path().join("pipe");
-        create_pipe(&path).expect("create pipe");
-        let metadata = fs::metadata(&path).expect("metadata");
-        assert!(metadata.file_type().is_fifo(), "expected FIFO at {path:?}");
-    }
+enum InvocationKind {
+    Initial,
+    Resume,
 }

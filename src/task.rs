@@ -11,8 +11,6 @@ pub type TaskId = String;
 #[derive(Clone, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum TaskState {
-    #[value(name = "IDLE")]
-    Idle,
     #[value(name = "RUNNING")]
     Running,
     #[value(name = "STOPPED")]
@@ -27,7 +25,6 @@ impl TaskState {
     /// Returns the canonical uppercase representation for this state.
     pub fn as_str(&self) -> &'static str {
         match self {
-            TaskState::Idle => "IDLE",
             TaskState::Running => "RUNNING",
             TaskState::Stopped => "STOPPED",
             TaskState::Archived => "ARCHIVED",
@@ -59,6 +56,10 @@ pub struct TaskMetadata {
     pub initial_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
 }
 
 impl TaskMetadata {
@@ -74,6 +75,8 @@ impl TaskMetadata {
             last_result: None,
             initial_prompt: None,
             last_prompt: None,
+            config_path: None,
+            working_dir: None,
         }
     }
 
