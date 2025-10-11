@@ -35,18 +35,18 @@ The CLI exposes several subcommands; run `codex-tasks <command> --help` for full
 | `codex-tasks start [-t <title>] [prompt]` | Create a new task, optionally sending an initial prompt. |
 | `codex-tasks send <task_id> <prompt>` | Send another prompt to an existing task. |
 | `codex-tasks status [--json] <task_id>` | Show live status, metadata, and the last prompt/result. |
-| `codex-tasks log [-f\|--follow] [--forever] [-n <lines>] <task_id>` | Stream or tail the transcript for a task. |
+| `codex-tasks log [--json] [-f\|--follow] [--forever] [-n <lines>] <task_id>` | Stream or tail the transcript for a task (human transcript by default, raw JSONL with `--json`). |
 | `codex-tasks stop [-a\|--all] [<task_id>]` | Gracefully shut down a worker; use `-a/--all` to stop every idle task. |
 | `codex-tasks ls [-a\|--all] [--state <STATE> ...]` | List active tasks, optionally including archived ones and filtering by state. |
 | `codex-tasks archive [-a\|--all] [<task_id>]` | Archive a specific task or bulk archive all STOPPED/DIED tasks. |
 
 The `start` subcommand accepts additional flags for tailoring the worker environment:
 - `--config-file PATH` loads a custom `config.toml` for `codex proto` (the file must be named `config.toml`).
-- `--working-dir DIR` runs `codex proto` inside the specified directory, creating it when needed.
+- `--working-dir DIR` runs `codex proto` inside the specified directory, creating it when needed. When omitted, `codex-tasks start` captures the current working directory and reuses it for all subsequent prompts sent to the same task.
 - `--repo URL` clones a Git repository into the working directory before launching the worker (requires `--working-dir`).
 - `--repo-ref REF` checks out the given branch, tag, or commit after cloning the repository.
 
-The `log -f/--follow` flag now exits automatically once the worker returns to `IDLE`, `STOPPED`, or `DIED`. Use `--forever` (or `-F`) to retain the original "follow until interrupted" behavior. The `archive -a/--all` flag bulk-archives every task currently in `STOPPED` or `DIED` state.
+The `log` command emits the same human-readable transcript as `codex exec` by default; pass `--json` to see the underlying JSONL event stream. The `log -f/--follow` flag exits automatically once the worker returns to `IDLE`, `STOPPED`, or `DIED`. Use `--forever` (or `-F`) to retain the original "follow until interrupted" behavior. The `archive -a/--all` flag bulk-archives every task currently in `STOPPED` or `DIED` state.
 
 ### Typical workflow
 ```bash
