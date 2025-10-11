@@ -165,11 +165,9 @@ fn ls_lists_active_and_archived_tasks() {
     cmd.env("HOME", home.path()).args(["ls", "--all"]);
     cmd.assert()
         .success()
-        .stdout(predicates::str::contains("ID"))
+        .stdout(predicates::str::contains("Working Dir"))
         .stdout(predicates::str::contains("task-active"))
         .stdout(predicates::str::contains("task-archived"))
-        .stdout(predicates::str::contains("ACTIVE"))
-        .stdout(predicates::str::contains("ARCHIVE"))
         .stdout(predicates::str::contains("RUNNING"))
         .stdout(predicates::str::contains("ARCHIVED"));
 }
@@ -276,9 +274,8 @@ fn ls_supports_state_filtering() {
         .success()
         .stdout(predicates::str::contains("task-running"))
         .stdout(predicates::str::contains("RUNNING"))
-        .stdout(predicates::str::contains("ACTIVE"))
         .stdout(predicates::str::contains("ID"))
-        .stdout(predicates::str::contains("ARCHIVE").not())
+        .stdout(predicates::str::contains("Working Dir"))
         .stdout(predicates::str::contains("task-archived").not());
 }
 
@@ -608,8 +605,19 @@ fn send_appends_prompt_to_log() {
 
     let log_path = env.tasks_root().join(&task_id).join("task.log");
     let log_contents = fs::read_to_string(&log_path).expect("read log");
-    assert!(log_contents.contains("USER: second prompt"));
-    assert!(log_contents.contains("ASSISTANT: response 2: second prompt"));
+    let events: Vec<Value> = log_contents
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("valid json line"))
+        .collect();
+
+    assert!(events.iter().any(|event| {
+        event["type"] == "user_message" && event["message"] == "second prompt"
+    }));
+    assert!(events.iter().any(|event| {
+        event["type"] == "item.completed"
+            && event["item"]["type"] == "agent_message"
+            && event["item"]["text"].as_str().is_some_and(|text| text.contains("second prompt"))
+    }));
 }
 
 #[test]
@@ -1199,7 +1207,7 @@ fn log_displays_entire_file() {
 
     let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
     cmd.env("HOME", home.path());
-    cmd.args(["log", "task-123"]);
+    cmd.args(["log", "--json", "task-123"]);
     cmd.assert().success().stdout("line one\nline two\n");
 }
 
@@ -1213,7 +1221,7 @@ fn log_honors_tail_flag() {
 
     let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
     cmd.env("HOME", home.path());
-    cmd.args(["log", "-n", "1", "task-abc"]);
+    cmd.args(["log", "--json", "-n", "1", "task-abc"]);
     cmd.assert().success().stdout("line\n");
 }
 
@@ -1235,7 +1243,7 @@ fn log_reads_archived_tasks() {
 
     let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
     cmd.env("HOME", home.path());
-    cmd.args(["log", "task-archived"]);
+    cmd.args(["log", "--json", "task-archived"]);
     cmd.assert().success().stdout("archived\ncontent\n");
 }
 
@@ -1255,7 +1263,7 @@ fn log_follow_exits_when_task_stopped() {
     let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
     let assert = cmd
         .env("HOME", home.path())
-        .args(["log", "-f", "task-idle"])
+        .args(["log", "--json", "-f", "task-idle"])
         .assert()
         .success();
 
@@ -1289,7 +1297,7 @@ fn log_follow_waits_for_log_file_creation() {
     let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
     let assert = cmd
         .env("HOME", home.path())
-        .args(["log", "-f", task_id])
+        .args(["log", "--json", "-f", task_id])
         .assert()
         .success();
 
@@ -1330,7 +1338,7 @@ fn log_follow_exits_for_archived_tasks() {
     let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
     let assert = cmd
         .env("HOME", home.path())
-        .args(["log", "-f", "task-archived"])
+        .args(["log", "--json", "-f", "task-archived"])
         .assert()
         .success();
 
