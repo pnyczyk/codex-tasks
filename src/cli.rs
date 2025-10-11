@@ -141,10 +141,13 @@ pub struct WorkerArgs {
     /// Filesystem root containing task artifacts.
     #[arg(long = "store-root")]
     pub store_root: PathBuf,
+    /// Optional existing task identifier (Codex thread_id) to resume.
+    #[arg(long = "task-id")]
+    pub task_id: Option<String>,
     /// Optional task title (primarily used for diagnostics).
     #[arg(long)]
     pub title: Option<String>,
-    /// Optional prompt to send once the worker is fully initialized.
+    /// Prompt to send to the worker.
     #[arg(long)]
     pub prompt: Option<String>,
     /// Optional Codex config file that should override the default configuration.

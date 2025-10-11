@@ -2,11 +2,9 @@ use std::collections::VecDeque;
 use std::convert::TryFrom;
 use std::ffi::{CString, OsString};
 use std::fs;
-use std::io::{BufRead, BufReader};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
-use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -542,23 +540,6 @@ fn send_returns_error_for_missing_task() {
 }
 
 #[test]
-fn send_rejects_stopped_tasks() {
-    let tmp = tempdir().expect("tempdir");
-    let tasks_dir = tmp.path().join(".codex").join("tasks");
-    fs::create_dir_all(&tasks_dir).expect("tasks dir");
-
-    let task_id = "stopped-task";
-    write_metadata(&tasks_dir, task_id, "STOPPED");
-
-    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
-    cmd.env("HOME", tmp.path())
-        .args(["send", task_id, "prompt"]);
-    cmd.assert().failure().stderr(predicates::str::contains(
-        "prompt pipe for task stopped-task is missing",
-    ));
-}
-
-#[test]
 fn send_rejects_died_tasks() {
     let tmp = tempdir().expect("tempdir");
     let tasks_dir = tmp.path().join(".codex").join("tasks");
@@ -612,83 +593,36 @@ fn send_rejects_archived_tasks() {
 }
 
 #[test]
-fn send_writes_prompt_to_pipe() {
-    let tmp = tempdir().expect("tempdir");
-    let tasks_dir = tmp.path().join(".codex").join("tasks");
-    fs::create_dir_all(&tasks_dir).expect("tasks dir");
+fn send_appends_prompt_to_log() {
+    let env = IntegrationTestEnv::new();
+    let task_id = env.start_task("Active Task", "first prompt");
+    env.wait_for_condition(&task_id, |value| value["state"] == "STOPPED");
 
-    let task_id = "active-task";
-    write_metadata(&tasks_dir, task_id, "STOPPED");
-    let pipe_path = tasks_dir.join(task_id).join("task.pipe");
-    create_pipe(&pipe_path);
+    let mut send = env.command();
+    send.args(["send", &task_id, "second prompt"]);
+    send.assert().success();
 
-    let (tx, rx) = mpsc::channel();
-    let reader_path = pipe_path.clone();
-    let reader = thread::spawn(move || {
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .open(&reader_path)
-            .expect("open pipe for read");
-        let mut reader = BufReader::new(file);
-        let mut line = String::new();
-        reader.read_line(&mut line).expect("read line");
-        tx.send(line).expect("send line");
+    env.wait_for_condition(&task_id, |value| {
+        value["state"] == "STOPPED" && value["last_prompt"] == "second prompt"
     });
 
-    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
-    cmd.env("HOME", tmp.path())
-        .args(["send", task_id, "hello world"]);
-    cmd.assert().success();
-
-    let line = rx.recv().expect("prompt from pipe");
-    reader.join().expect("reader thread");
-    assert_eq!(line, "hello world\n");
-
-    let metadata_path = tasks_dir.join(task_id).join("task.json");
-    let metadata: Value =
-        serde_json::from_str(&fs::read_to_string(&metadata_path).expect("read metadata"))
-            .expect("parse metadata");
-    assert_eq!(metadata["state"], "RUNNING");
+    let log_path = env.tasks_root().join(&task_id).join("task.log");
+    let log_contents = fs::read_to_string(&log_path).expect("read log");
+    assert!(log_contents.contains("USER: second prompt"));
+    assert!(log_contents.contains("ASSISTANT: response 2: second prompt"));
 }
 
 #[test]
-fn send_errors_when_pipe_missing() {
-    let tmp = tempdir().expect("tempdir");
-    let tasks_dir = tmp.path().join(".codex").join("tasks");
-    fs::create_dir_all(&tasks_dir).expect("tasks dir");
+fn send_errors_when_worker_running() {
+    let env = IntegrationTestEnv::with_delay(5000);
+    let task_id = env.start_task("Slow Task", "initial");
+    env.wait_for_condition(&task_id, |value| value["state"] == "RUNNING");
 
-    let task_id = "missing-pipe-task";
-    write_metadata(&tasks_dir, task_id, "STOPPED");
-
-    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
-    cmd.env("HOME", tmp.path())
-        .args(["send", task_id, "prompt"]);
+    let mut cmd = env.command();
+    cmd.args(["send", &task_id, "follow-up"]);
     cmd.assert()
         .failure()
-        .stderr(predicates::str::contains(
-            "prompt pipe for task missing-pipe-task is missing; the worker may have STOPPED, DIED, or been ARCHIVED",
-        ));
-}
-
-#[test]
-fn send_errors_when_pipe_has_no_reader() {
-    let tmp = tempdir().expect("tempdir");
-    let tasks_dir = tmp.path().join(".codex").join("tasks");
-    fs::create_dir_all(&tasks_dir).expect("tasks dir");
-
-    let task_id = "no-reader-task";
-    write_metadata(&tasks_dir, task_id, "STOPPED");
-    let pipe_path = tasks_dir.join(task_id).join("task.pipe");
-    create_pipe(&pipe_path);
-
-    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
-    cmd.env("HOME", tmp.path())
-        .args(["send", task_id, "prompt"]);
-    cmd.assert()
-        .failure()
-        .stderr(predicates::str::contains(
-            "task no-reader-task is not accepting prompts; the worker may have STOPPED, DIED, or been ARCHIVED",
-        ));
+        .stderr(predicates::str::contains("currently running"));
 }
 
 #[test]
@@ -703,12 +637,12 @@ fn stop_handles_missing_task_gracefully() {
 
 #[test]
 fn stop_all_stops_running_tasks() {
-    let env = IntegrationTestEnv::new();
+    let env = IntegrationTestEnv::with_delay(5000);
     let first = env.start_task("Idle One", "prompt one");
     let second = env.start_task("Idle Two", "prompt two");
 
-    env.wait_for_condition(&first, |value| value["state"] == "STOPPED");
-    env.wait_for_condition(&second, |value| value["state"] == "STOPPED");
+    env.wait_for_condition(&first, |value| value["state"] == "RUNNING");
+    env.wait_for_condition(&second, |value| value["state"] == "RUNNING");
 
     let mut cmd = env.command();
     let assert = cmd.args(["stop", "-a"]).assert().success();
@@ -923,7 +857,7 @@ fn end_to_end_task_lifecycle_flow() {
     let stop_assert = stop.assert().success();
     let stop_output =
         String::from_utf8(stop_assert.get_output().stdout.clone()).expect("stdout utf8");
-    assert!(stop_output.contains("stopped"));
+    assert!(stop_output.contains("not running"));
 
     env.wait_for_condition(&task_id, |value| value["state"] == "STOPPED");
 

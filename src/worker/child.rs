@@ -1,77 +1,69 @@
 use std::env;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use tempfile::NamedTempFile;
 use tokio::fs::OpenOptions as TokioOpenOptions;
-use tokio::io::{self as tokio_io, AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter, Lines};
+use tokio::io::{self as tokio_io, AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::Command;
 
 use crate::storage::{TaskPaths, TaskStore};
 use crate::task::{TaskId, TaskMetadata, TaskState};
 
-/// Environment variable that carries the optional title for the worker.
 pub const TITLE_ENV_VAR: &str = "CODEX_TASK_TITLE";
-/// Environment variable that carries the initial prompt for the worker.
 pub const PROMPT_ENV_VAR: &str = "CODEX_TASK_PROMPT";
-/// When set, the worker will exit immediately after it records its PID.
 pub const EXIT_AFTER_START_ENV_VAR: &str = "CODEX_TASKS_EXIT_AFTER_START";
+const STDERR_PREFIX: &str = "[stderr]";
 
-const THREAD_STARTED_EVENT: &str = "thread.started";
-const STDERR_PREFIX: &[u8] = b"[stderr] ";
-
-/// Configuration assembled from CLI arguments and environment variables for a worker.
 #[derive(Clone, Debug)]
 pub struct WorkerConfig {
     pub store_root: PathBuf,
+    pub task_id: Option<TaskId>,
     pub title: Option<String>,
-    pub initial_prompt: String,
+    pub prompt: String,
     pub config_path: Option<PathBuf>,
     pub working_dir: Option<PathBuf>,
 }
 
 impl WorkerConfig {
-    /// Builds a configuration for the worker, preferring explicit CLI values and
-    /// falling back to environment variables when they are absent.
     pub fn new(
         store_root: PathBuf,
+        task_id: Option<String>,
         title: Option<String>,
-        initial_prompt: Option<String>,
+        prompt: Option<String>,
         config_path: Option<PathBuf>,
         working_dir: Option<PathBuf>,
     ) -> Result<Self> {
         let title = title.or_else(|| env::var(TITLE_ENV_VAR).ok());
-        let initial_prompt = initial_prompt
+        let prompt = prompt
             .or_else(|| env::var(PROMPT_ENV_VAR).ok())
-            .ok_or_else(|| anyhow!("initial prompt is required when launching a worker"))?;
-
-        if initial_prompt.trim().is_empty() {
-            bail!("initial prompt must not be empty");
+            .ok_or_else(|| anyhow!("prompt is required when launching a worker"))?;
+        if prompt.trim().is_empty() {
+            bail!("prompt must not be empty");
         }
 
-        let config_path = canonicalize_optional_path(config_path)
-            .context("failed to prepare worker config path")?;
-        let working_dir = canonicalize_optional_path(working_dir)
-            .context("failed to prepare worker working directory")?;
+        let config_path = canonicalize_optional(config_path)
+            .context("failed to resolve config path for worker")?;
+        let working_dir = canonicalize_optional(working_dir)
+            .context("failed to resolve working directory for worker")?;
 
         Ok(Self {
             store_root,
+            task_id,
             title,
-            initial_prompt,
+            prompt,
             config_path,
             working_dir,
         })
     }
 
-    /// Returns a [`TaskStore`] rooted at the configured location.
     pub fn store(&self) -> TaskStore {
         TaskStore::new(self.store_root.clone())
     }
 
-    /// Directory that acts as `CODEX_HOME` override when a custom config file is provided.
     pub fn codex_home_override(&self) -> Result<Option<PathBuf>> {
         match &self.config_path {
             Some(path) => {
@@ -88,24 +80,23 @@ impl WorkerConfig {
     }
 }
 
-fn canonicalize_optional_path(path: Option<PathBuf>) -> Result<Option<PathBuf>> {
+fn canonicalize_optional(path: Option<PathBuf>) -> Result<Option<PathBuf>> {
     match path {
         Some(p) => {
             Ok(Some(p.canonicalize().with_context(|| {
-                format!("failed to resolve path {}", p.display())
+                format!("failed to canonicalize {}", p.display())
             })?))
         }
         None => Ok(None),
     }
 }
 
-/// Runs the worker process until it is signalled to exit.
 pub async fn run_worker(config: WorkerConfig) -> Result<()> {
-    if should_exit_after_start() {
+    if env::var(EXIT_AFTER_START_ENV_VAR).is_ok() {
         return Ok(());
     }
 
-    let worker = Worker::new(config).context("failed to initialize worker")?;
+    let worker = Worker::initialize(config).await?;
     worker.run().await
 }
 
@@ -116,63 +107,64 @@ struct Worker {
 }
 
 impl Worker {
-    fn new(config: WorkerConfig) -> Result<Self> {
+    async fn initialize(mut config: WorkerConfig) -> Result<Self> {
         let store = config.store();
         store.ensure_layout()?;
+
+        let session = if let Some(task_id) = &config.task_id {
+            let paths = store.task(task_id.clone());
+            if !paths.metadata_path().exists() {
+                bail!("task {task_id} was not found");
+            }
+            let metadata = paths.read_metadata()?;
+            if config.config_path.is_none() {
+                config.config_path = metadata.config_path.as_ref().map(PathBuf::from);
+            }
+            if config.working_dir.is_none() {
+                config.working_dir = metadata.working_dir.as_ref().map(PathBuf::from);
+            }
+
+            let log_file = TokioOpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(paths.log_path())
+                .await
+                .with_context(|| format!("failed to open log file for task {task_id}"))?;
+            Some(ActiveSession::from_existing(
+                task_id.clone(),
+                paths,
+                log_file,
+            ))
+        } else {
+            None
+        };
+
         Ok(Self {
             config,
             store,
-            session: None,
+            session,
         })
     }
 
     async fn run(mut self) -> Result<()> {
-        let initial_prompt = self.config.initial_prompt.clone();
-        self.run_invocation(initial_prompt, InvocationKind::Initial)
-            .await?;
+        let initial = self.session.is_none();
+        let prompt = self.config.prompt.clone();
+        let request = if initial {
+            InvocationKind::Initial
+        } else {
+            InvocationKind::Resume
+        };
 
-        {
-            let session = self
-                .session
-                .as_mut()
-                .ok_or_else(|| anyhow!("session not initialized after initial invocation"))?;
-            session.prepare_prompt_reader().await?;
-        }
-
-        loop {
-            let prompt_opt = {
-                let session = self
-                    .session
-                    .as_mut()
-                    .ok_or_else(|| anyhow!("session not initialized after initial invocation"))?;
-                session.next_prompt().await?
-            };
-
-            let prompt = match prompt_opt {
-                Some(prompt) => prompt,
-                None => break,
-            };
-
-            let trimmed = prompt.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if trimmed == "/quit" {
-                break;
-            }
-
-            self.run_invocation(prompt, InvocationKind::Resume).await?;
-        }
-
-        self.shutdown().await
+        self.run_invocation(prompt, request).await?;
+        self.finalize().await
     }
 
     async fn run_invocation(&mut self, prompt: String, kind: InvocationKind) -> Result<()> {
-        if prompt.trim().is_empty() {
-            bail!("prompt must not be empty");
-        }
+        let mut buffered_log: Vec<String> = Vec::new();
+        let mut pending_pid: Option<i32> = None;
 
         if let Some(session) = self.session.as_mut() {
+            session.record_user_prompt(&prompt).await?;
             session
                 .paths
                 .update_metadata(|metadata| {
@@ -180,10 +172,12 @@ impl Worker {
                     metadata.last_prompt = Some(prompt.clone());
                 })
                 .context("failed to update metadata before invocation")?;
+        } else {
+            buffered_log.push(format!("USER: {}", prompt.trim()));
         }
 
         let result_file = NamedTempFile::new_in(&self.config.store_root)
-            .context("failed to allocate temp file for last message")?;
+            .context("failed to create temporary result file")?;
         let result_path = result_file.into_temp_path();
 
         let codex_home = self.config.codex_home_override()?;
@@ -197,7 +191,6 @@ impl Worker {
             command.arg("--cd");
             command.arg(dir);
         }
-
         if let Some(home) = &codex_home {
             command.env("CODEX_HOME", home);
         }
@@ -212,10 +205,10 @@ impl Worker {
                 command.arg(&prompt);
             }
             (None, InvocationKind::Resume) => {
-                bail!("cannot resume before establishing a Codex thread");
+                bail!("cannot resume without an existing task id");
             }
             (Some(_), InvocationKind::Initial) => {
-                bail!("initial invocation already performed for this worker");
+                bail!("initial invocation already performed");
             }
         }
 
@@ -224,6 +217,10 @@ impl Worker {
         command.stderr(std::process::Stdio::piped());
 
         let mut child = command.spawn().context("failed to spawn `codex exec`")?;
+        let child_pid = child
+            .id()
+            .ok_or_else(|| anyhow!("failed to determine child pid"))?;
+
         let stdout = child
             .stdout
             .take()
@@ -233,12 +230,17 @@ impl Worker {
             .take()
             .context("failed to capture stderr of `codex exec`")?;
 
-        let mut stdout_reader = BufReader::new(stdout).lines();
-        let mut stderr_reader = BufReader::new(stderr).lines();
+        if let Some(session) = self.session.as_mut() {
+            session.paths.write_pid(child_pid as i32)?;
+            session
+                .paths
+                .update_metadata(|metadata| metadata.set_state(TaskState::Running))?;
+        } else {
+            pending_pid = Some(child_pid as i32);
+        }
 
-        let mut buffered_stdout = Vec::new();
-        let mut buffered_stderr = Vec::new();
-
+        let mut stdout_lines = BufReader::new(stdout).lines();
+        let mut stderr_lines = BufReader::new(stderr).lines();
         let wait_handle = tokio::spawn(async move { child.wait().await });
 
         let mut stdout_done = false;
@@ -246,78 +248,63 @@ impl Worker {
 
         loop {
             tokio::select! {
-                line = stdout_reader.next_line(), if !stdout_done => {
-                    match line {
-                        Ok(Some(content)) => {
-                            self.handle_stdout_line(&prompt, &mut buffered_stdout, &mut buffered_stderr, &content).await?;
+                        line = stdout_lines.next_line(), if !stdout_done => {
+                            match line {
+                                Ok(Some(content)) => {
+                                    self.handle_stdout_line(
+                                        &prompt,
+                                        &mut buffered_log,
+                &mut pending_pid,
+                &content,
+            ).await?;
+                                }
+                            Ok(None) => stdout_done = true,
+                            Err(err) => return Err(err).context("failed to read stdout from `codex exec`"),
                         }
-                        Ok(None) => stdout_done = true,
-                        Err(err) => return Err(err).context("failed to read stdout from `codex exec`"),
                     }
-                }
-                line = stderr_reader.next_line(), if !stderr_done => {
-                    match line {
-                        Ok(Some(content)) => {
-                            self.handle_stderr_line(&mut buffered_stderr, &content).await?;
+                    line = stderr_lines.next_line(), if !stderr_done => {
+                            match line {
+                                Ok(Some(content)) => {
+                                    self.write_log_line(format!("{STDERR_PREFIX} {content}").as_str()).await?;
+                                }
+                                Ok(None) => stderr_done = true,
+                                Err(err) => return Err(err).context("failed to read stderr from `codex exec`"),
+                            }
                         }
-                        Ok(None) => stderr_done = true,
-                        Err(err) => return Err(err).context("failed to read stderr from `codex exec`"),
+                        else => {
+                            if stdout_done && stderr_done {
+                                break;
+                            }
+                        }
                     }
-                }
-                else => {
-                    if stdout_done && stderr_done {
-                        break;
-                    }
-                }
-            }
         }
 
         let status = wait_handle
             .await
-            .context("failed to wait for `codex exec` child task")?
+            .context("failed to join exec child task")?
             .context("`codex exec` terminated unexpectedly")?;
 
-        let session = self
-            .session
-            .as_mut()
-            .ok_or_else(|| anyhow!("Codex thread was not established before process exit"))?;
-
-        session.log.flush().await?;
-
-        let exit_state = if status.success() {
-            TaskState::Stopped
-        } else {
-            TaskState::Died
-        };
-
-        session
-            .paths
-            .update_metadata(|metadata| {
-                metadata.set_state(exit_state.clone());
-                metadata.last_prompt = Some(prompt.clone());
-            })
-            .context("failed to update task metadata after invocation")?;
+        if status.success() {
+            if let Some(session) = self.session.as_mut() {
+                session
+                    .paths
+                    .update_metadata(|metadata| metadata.set_state(TaskState::Stopped))?;
+            }
+        } else if let Some(session) = self.session.as_mut() {
+            session
+                .paths
+                .update_metadata(|metadata| metadata.set_state(TaskState::Died))?;
+        }
 
         if result_path.exists() {
             let message =
-                fs::read_to_string(&result_path).context("failed to read last message output")?;
-            let final_path = session.paths.result_path();
-            fs::write(&final_path, &message)
-                .with_context(|| format!("failed to persist result at {}", final_path.display()))?;
-            session
-                .paths
-                .update_metadata(|metadata| {
-                    metadata.last_result = Some(message.clone());
-                })
-                .context("failed to update metadata with last result")?;
-        }
-
-        result_path
-            .close()
-            .context("failed to remove temporary result file")?;
-
-        if exit_state == TaskState::Died {
-            bail!("codex exec failed with status {}", status);
+                fs::read_to_string(&result_path).context("failed to read result output")?;
+            if let Some(session) = self.session.as_mut() {
+                session.record_last_result(&message).await?;
+            }
+            result_path
+                .close()
+                .context("failed to remove temporary result file")?;
         }
 
         Ok(())
@@ -326,35 +313,29 @@ impl Worker {
     async fn handle_stdout_line(
         &mut self,
         prompt: &str,
-        buffered_stdout: &mut Vec<String>,
-        buffered_stderr: &mut Vec<String>,
+        buffered_log: &mut Vec<String>,
+        pending_pid: &mut Option<i32>,
         line: &str,
     ) -> Result<()> {
-        if let Some(thread_id) = try_extract_thread_id(line) {
-            if self.session.is_none() {
-                self.initialize_session(thread_id, prompt, buffered_stdout, buffered_stderr)
+        if self.session.is_none() {
+            if let Some(thread_id) = extract_thread_id(line) {
+                self.initialize_session(thread_id, prompt, buffered_log, pending_pid)
                     .await?;
+                return Ok(());
             }
         }
 
-        if let Some(session) = self.session.as_mut() {
-            session.write_stdout(line).await?;
-        } else {
-            buffered_stdout.push(line.to_string());
+        if self.session.is_none() {
+            if let Some(rendered) = render_event(line) {
+                buffered_log.push(rendered);
+            }
+            return Ok(());
         }
-        Ok(())
-    }
 
-    async fn handle_stderr_line(
-        &mut self,
-        buffered_stderr: &mut Vec<String>,
-        line: &str,
-    ) -> Result<()> {
-        if let Some(session) = self.session.as_mut() {
-            session.write_stderr(line).await?;
-        } else {
-            buffered_stderr.push(line.to_string());
+        if let Some(rendered) = render_event(line) {
+            self.write_log_line(&rendered).await?;
         }
+
         Ok(())
     }
 
@@ -362,23 +343,39 @@ impl Worker {
         &mut self,
         thread_id: TaskId,
         prompt: &str,
-        buffered_stdout: &mut Vec<String>,
-        buffered_stderr: &mut Vec<String>,
+        buffered_log: &mut Vec<String>,
+        pending_pid: &mut Option<i32>,
     ) -> Result<()> {
         let paths = self.store.task(thread_id.clone());
         paths.ensure_directory()?;
 
-        let pid =
-            i32::try_from(std::process::id()).context("worker process id exceeds i32 range")?;
-        paths.write_pid(pid)?;
-
-        let mut metadata = TaskMetadata::new(
-            thread_id.clone(),
-            self.config.title.clone(),
-            TaskState::Running,
-        );
-        metadata.initial_prompt = Some(prompt.to_string());
-        metadata.last_prompt = Some(prompt.to_string());
+        let mut metadata = if paths.metadata_path().exists() {
+            paths.read_metadata()?
+        } else {
+            let mut meta = TaskMetadata::new(
+                thread_id.clone(),
+                self.config.title.clone(),
+                TaskState::Running,
+            );
+            meta.initial_prompt = Some(prompt.to_string());
+            meta.last_prompt = Some(prompt.to_string());
+            meta
+        };
+        metadata.set_state(TaskState::Running);
+        if metadata.config_path.is_none() {
+            metadata.config_path = self
+                .config
+                .config_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_string());
+        }
+        if metadata.working_dir.is_none() {
+            metadata.working_dir = self
+                .config
+                .working_dir
+                .as_ref()
+                .map(|dir| dir.to_string_lossy().to_string());
+        }
         self.store.save_metadata(&metadata)?;
 
         let log_file = TokioOpenOptions::new()
@@ -387,67 +384,44 @@ impl Worker {
             .open(paths.log_path())
             .await
             .with_context(|| format!("failed to open log file for task {}", thread_id))?;
-        let mut log = BufWriter::new(log_file);
+        let mut session = ActiveSession::new(thread_id.clone(), paths, log_file);
 
-        for line in buffered_stdout.drain(..) {
-            log.write_all(line.as_bytes()).await?;
-            log.write_all(b"\n").await?;
+        for line in buffered_log.drain(..) {
+            session.write_line(&line).await?;
         }
-        for line in buffered_stderr.drain(..) {
-            log.write_all(STDERR_PREFIX).await?;
-            log.write_all(line.as_bytes()).await?;
-            log.write_all(b"\n").await?;
-        }
-        log.flush().await?;
 
-        let pipe_path = paths.pipe_path();
-        create_pipe(&pipe_path)
-            .with_context(|| format!("failed to create prompt pipe for {}", thread_id))?;
-        let prompt_reader = PromptReader::new(pipe_path)
-            .await
-            .with_context(|| format!("failed to initialize prompt reader for {}", thread_id))?;
+        if let Some(pid) = pending_pid.take() {
+            session.paths.write_pid(pid)?;
+        }
 
         println!("{thread_id}");
         if let Err(err) = tokio_io::stdout().flush().await {
-            eprintln!("failed to flush handshake stdout: {err:#}");
+            eprintln!("failed to flush worker handshake: {err:#}");
         }
 
-        self.session = Some(ActiveSession {
-            thread_id,
-            paths,
-            log,
-            prompt_reader: Some(prompt_reader),
-        });
-
+        self.session = Some(session);
         Ok(())
     }
 
-    async fn shutdown(mut self) -> Result<()> {
+    async fn write_log_line(&mut self, line: &str) -> Result<()> {
+        if let Some(session) = self.session.as_mut() {
+            session.write_line(line).await?;
+        }
+        Ok(())
+    }
+
+    async fn finalize(mut self) -> Result<()> {
         if let Some(mut session) = self.session.take() {
-            if let Err(err) = session.paths.update_metadata(|metadata| {
-                metadata.set_state(TaskState::Stopped);
-            }) {
-                eprintln!(
-                    "failed to mark task {} as stopped: {err:#}",
-                    session.paths.id()
-                );
-            }
             if let Err(err) = session.flush().await {
                 eprintln!(
                     "failed to flush log for task {}: {err:#}",
-                    session.paths.id()
-                );
-            }
-            if let Err(err) = session.paths.remove_pipe() {
-                eprintln!(
-                    "failed to remove pipe for task {}: {err:#}",
-                    session.paths.id()
+                    session.thread_id
                 );
             }
             if let Err(err) = session.paths.remove_pid() {
                 eprintln!(
-                    "failed to remove pid for task {}: {err:#}",
-                    session.paths.id()
+                    "failed to remove pid file for task {}: {err:#}",
+                    session.thread_id
                 );
             }
         }
@@ -459,136 +433,77 @@ struct ActiveSession {
     thread_id: TaskId,
     paths: TaskPaths,
     log: BufWriter<tokio::fs::File>,
-    prompt_reader: Option<PromptReader>,
 }
 
 impl ActiveSession {
-    async fn write_stdout(&mut self, line: &str) -> io::Result<()> {
-        self.log.write_all(line.as_bytes()).await?;
-        self.log.write_all(b"\n").await
+    fn new(thread_id: TaskId, paths: TaskPaths, log: tokio::fs::File) -> Self {
+        Self {
+            thread_id,
+            paths,
+            log: BufWriter::new(log),
+        }
     }
 
-    async fn write_stderr(&mut self, line: &str) -> io::Result<()> {
-        self.log.write_all(STDERR_PREFIX).await?;
+    fn from_existing(thread_id: TaskId, paths: TaskPaths, log: tokio::fs::File) -> Self {
+        Self::new(thread_id, paths, log)
+    }
+
+    async fn write_line(&mut self, line: &str) -> io::Result<()> {
         self.log.write_all(line.as_bytes()).await?;
-        self.log.write_all(b"\n").await
+        self.log.write_all(b"\n").await?;
+        Ok(())
+    }
+
+    async fn record_user_prompt(&mut self, prompt: &str) -> io::Result<()> {
+        if !prompt.trim().is_empty() {
+            self.write_line(&format!("USER: {}", prompt.trim())).await?;
+        }
+        Ok(())
+    }
+
+    async fn record_last_result(&mut self, message: &str) -> Result<()> {
+        self.paths.write_last_result(message)?;
+        self.paths
+            .update_metadata(|metadata| metadata.last_result = Some(message.to_string()))?;
+        Ok(())
     }
 
     async fn flush(&mut self) -> io::Result<()> {
         self.log.flush().await
     }
+}
 
-    async fn prepare_prompt_reader(&mut self) -> Result<()> {
-        if self.prompt_reader.is_none() {
-            create_pipe(&self.paths.pipe_path())
-                .with_context(|| format!("failed to create prompt pipe for {}", self.thread_id))?;
-            self.prompt_reader = Some(
-                PromptReader::new(self.paths.pipe_path())
-                    .await
-                    .with_context(|| {
-                        format!("failed to initialize prompt reader for {}", self.thread_id)
-                    })?,
-            );
-        }
-        Ok(())
-    }
-
-    async fn next_prompt(&mut self) -> Result<Option<String>> {
-        let reader = match self.prompt_reader.as_mut() {
-            Some(reader) => reader,
-            None => return Ok(None),
-        };
-        reader.next_prompt().await
+fn extract_thread_id(line: &str) -> Option<TaskId> {
+    let value: Value = serde_json::from_str(line).ok()?;
+    match value.get("type")?.as_str()? {
+        "thread.started" => value.get("thread_id")?.as_str().map(|s| s.to_string()),
+        _ => None,
     }
 }
 
-struct PromptReader {
-    path: PathBuf,
-    lines: Lines<BufReader<tokio::fs::File>>,
-}
-
-impl PromptReader {
-    async fn new(path: PathBuf) -> Result<Self> {
-        let file = TokioOpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .await
-            .with_context(|| format!("failed to open prompt pipe at {}", path.display()))?;
-        let reader = BufReader::with_capacity(4096, file).lines();
-        Ok(Self {
-            path,
-            lines: reader,
-        })
-    }
-
-    async fn reopen(&mut self) -> Result<()> {
-        let file = TokioOpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.path)
-            .await
-            .with_context(|| format!("failed to reopen prompt pipe at {}", self.path.display()))?;
-        self.lines = BufReader::with_capacity(4096, file).lines();
-        Ok(())
-    }
-
-    async fn next_prompt(&mut self) -> Result<Option<String>> {
-        loop {
-            match self.lines.next_line().await {
-                Ok(Some(line)) => return Ok(Some(line)),
-                Ok(None) => {
-                    self.reopen().await?;
-                    continue;
-                }
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                Err(err) if err.kind() == io::ErrorKind::BrokenPipe => {
-                    self.reopen().await?;
-                }
-                Err(err) => {
-                    return Err(err).with_context(|| {
-                        format!("failed to read prompt from {}", self.path.display())
-                    });
-                }
-            }
-        }
-    }
-}
-
-fn should_exit_after_start() -> bool {
-    env::var(EXIT_AFTER_START_ENV_VAR).is_ok()
-}
-
-fn create_pipe(path: &Path) -> Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let c_path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| anyhow!("failed to convert pipe path to CString"))?;
-    let mode = libc::S_IRUSR | libc::S_IWUSR;
-    let result = unsafe { libc::mkfifo(c_path.as_ptr(), mode) };
-    if result == 0 {
-        return Ok(());
-    }
-
-    let err = io::Error::last_os_error();
-    if err.kind() == io::ErrorKind::AlreadyExists {
-        Ok(())
-    } else {
-        Err(err).with_context(|| format!("failed to create fifo at {}", path.display()))
-    }
-}
-
-fn try_extract_thread_id(line: &str) -> Option<TaskId> {
+fn render_event(line: &str) -> Option<String> {
     let value: Value = serde_json::from_str(line).ok()?;
     let event_type = value.get("type")?.as_str()?;
-    if event_type == THREAD_STARTED_EVENT {
-        value
-            .get("thread_id")
-            .and_then(Value::as_str)
-            .map(|s| s.to_string())
-    } else {
-        None
+    match event_type {
+        "item.completed" => {
+            let item = value.get("item")?;
+            let item_type = item.get("type")?.as_str().unwrap_or_default();
+            let text = item.get("text").and_then(Value::as_str).unwrap_or_default();
+            match item_type {
+                "agent_message" => Some(format!("ASSISTANT: {}", text.trim())),
+                "reasoning" => Some(format!("ASSISTANT (reasoning): {}", text.trim())),
+                _ => Some(format!("EVENT {}: {}", item_type, text.trim())),
+            }
+        }
+        "turn.completed" => Some("ASSISTANT: <end>".to_string()),
+        "error" => {
+            let message = value
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            Some(format!("ERROR: {}", message))
+        }
+        _ => None,
     }
 }
 

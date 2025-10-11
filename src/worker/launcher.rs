@@ -9,6 +9,7 @@ use super::child::{PROMPT_ENV_VAR, TITLE_ENV_VAR};
 #[derive(Debug)]
 pub struct WorkerLaunchRequest {
     pub store_root: PathBuf,
+    pub task_id: Option<String>,
     pub title: Option<String>,
     pub prompt: String,
     pub executable: Option<PathBuf>,
@@ -21,6 +22,7 @@ impl WorkerLaunchRequest {
     pub fn new(store_root: PathBuf, prompt: String) -> Self {
         Self {
             store_root,
+            task_id: None,
             title: None,
             prompt,
             executable: None,
@@ -34,6 +36,7 @@ impl WorkerLaunchRequest {
 pub fn spawn_worker(request: WorkerLaunchRequest) -> Result<Child> {
     let WorkerLaunchRequest {
         store_root,
+        task_id,
         title,
         prompt,
         executable,
@@ -50,6 +53,10 @@ pub fn spawn_worker(request: WorkerLaunchRequest) -> Result<Child> {
     command.arg("worker");
     command.arg("--store-root");
     command.arg(&store_root);
+    if let Some(task_id) = task_id {
+        command.arg("--task-id");
+        command.arg(task_id);
+    }
 
     if let Some(title) = title {
         command.env(TITLE_ENV_VAR, title);

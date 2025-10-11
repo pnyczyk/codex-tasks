@@ -40,9 +40,10 @@ OpenAI has deprecated the legacy `codex proto` interface in favor of `codex exec
 
 ### Worker Lifecycle
 - Replace the long-lived `codex proto` child process with on-demand `codex exec` invocations.
-- Require an initial prompt to bootstrap the first invocation; subsequent prompts flow through the FIFO.
+- Require an initial prompt to bootstrap the first invocation; each follow-up prompt starts a fresh worker that resumes the existing `thread_id`.
 - Stream JSON events from each invocation in real time: capture `thread.started` immediately to persist the session ID, establish storage rooted at the new `thread_id`, forward buffered and subsequent events into the log, and detect completion without blocking for user-facing output.
-- Launch `codex exec` with `--output-last-message <task_id>.result.tmp` so the final assistant reply is captured asynchronously; atomically promote the file to `<task_id>.result` when the process exits.
+- Launch `codex exec` with `--output-last-message <thread_id>.result.tmp` so the final assistant reply is captured asynchronously; atomically promote the file to `<thread_id>.result` when the process exits.
+- After an invocation finishes, terminate the worker, remove its PID file, and rely on the CLI to spawn a new worker for future prompts.
 - Maintain graceful shutdown: if a `/quit` marker is received, wait only for the in-flight invocation to supply its session ID (if missing), then drain remaining events, skip queued prompts, mark the task `STOPPED`, and clean up files.
 
 ### CLI & UX
@@ -55,8 +56,8 @@ OpenAI has deprecated the legacy `codex proto` interface in favor of `codex exec
 - Update status rendering and metadata helpers to reflect the simplified state machine.
 
 ### Logging & Storage
-- Continue writing JSONL events to `<task_id>.log` (where `<task_id>` is the Codex `thread_id`). Normalize events so downstream consumers do not break (e.g., convert `codex exec` specific event types into the existing schema where possible).
-- Use the `--output-last-message` artifact from each invocation to refresh `<task_id>.result` without waiting for the CLI to print the final assistant message.
+- Continue writing human-readable transcripts to `<thread_id>.log`, prefixing explicit `USER:` and `ASSISTANT:` markers derived from the JSONL events.
+- Use the `--output-last-message` artifact from each invocation to refresh `<thread_id>.result` without waiting for the CLI to print the final assistant message.
 - Ensure buffered startup events are persisted once storage is initialized so that no JSON output is lost prior to filesystem creation.
 
 ### Error Handling

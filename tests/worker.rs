@@ -66,15 +66,14 @@ fn worker_subcommand_writes_pid_file() {
         .expect("pid file should contain an integer");
     assert!(value > 0, "pid should be positive");
 
-    let pipe_path = task_dir.join("task.pipe");
-    let mut pipe = fs::OpenOptions::new()
-        .write(true)
-        .open(&pipe_path)
-        .expect("open task pipe for write");
-    use std::io::Write;
-    pipe.write_all(b"/quit\n").expect("write quit signal");
-    pipe.flush().expect("flush quit signal");
-
     let status = child.wait().expect("wait for worker to exit");
     assert!(status.success(), "worker exit status {status:?}");
+
+    let start = std::time::Instant::now();
+    while pid_path.exists() {
+        if start.elapsed() > std::time::Duration::from_secs(5) {
+            panic!("pid file should be removed after worker exits");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
 }

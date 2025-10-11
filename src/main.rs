@@ -7,10 +7,8 @@ pub mod worker;
 use std::collections::VecDeque;
 use std::env;
 use std::ffi::OsStr;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::thread;
@@ -19,7 +17,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use chrono::Utc;
 use clap::Parser;
-use libc::{ENXIO, O_NONBLOCK};
 
 use crate::cli::{
     ArchiveArgs, Cli, Command, LogArgs, LsArgs, SendArgs, StartArgs, StatusArgs, StopArgs,
@@ -73,49 +70,7 @@ fn handle_start(args: StartArgs) -> Result<()> {
     request.working_directory = working_dir;
 
     let mut child = spawn_worker(request).context("failed to launch worker process")?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("worker did not expose stdout for handshake")?;
-
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut reader = std::io::BufReader::new(stdout);
-        let mut line = String::new();
-        let result = reader
-            .read_line(&mut line)
-            .map_err(anyhow::Error::from)
-            .and_then(|bytes| {
-                if bytes == 0 {
-                    Err(anyhow!("worker exited before publishing thread id"))
-                } else {
-                    Ok(line.trim().to_string())
-                }
-            });
-        let _ = tx.send(result);
-    });
-
-    let thread_id = match rx.recv_timeout(Duration::from_secs(60)) {
-        Ok(Ok(id)) if !id.is_empty() => id,
-        Ok(Ok(_)) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("worker returned empty thread identifier");
-        }
-        Ok(Err(err)) => {
-            let _ = child.kill();
-            if let Ok(status) = child.wait() {
-                bail!("failed to start worker: {err:#}. worker exited with {status}");
-            } else {
-                bail!("failed to start worker: {err:#}");
-            }
-        }
-        Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("timed out waiting for worker to publish thread id");
-        }
-    };
+    let thread_id = receive_thread_id(&mut child)?;
 
     drop(child);
 
@@ -138,6 +93,52 @@ fn resolve_start_prompt(raw_prompt: String) -> Result<String> {
         bail!("prompt must not be empty");
     } else {
         Ok(raw_prompt)
+    }
+}
+
+fn receive_thread_id(child: &mut std::process::Child) -> Result<String> {
+    let stdout = child
+        .stdout
+        .take()
+        .context("worker did not expose stdout for handshake")?;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        let result = reader
+            .read_line(&mut line)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| {
+                if bytes == 0 {
+                    Err(anyhow!("worker exited before publishing thread id"))
+                } else {
+                    Ok(line.trim().to_string())
+                }
+            });
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(Duration::from_secs(60)) {
+        Ok(Ok(id)) if !id.is_empty() => Ok(id),
+        Ok(Ok(_)) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("worker returned empty thread identifier");
+        }
+        Ok(Err(err)) => {
+            let _ = child.kill();
+            if let Ok(status) = child.wait() {
+                bail!("failed to start worker: {err:#}. worker exited with {status}");
+            } else {
+                bail!("failed to start worker: {err:#}");
+            }
+        }
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("timed out waiting for worker to publish thread id");
+        }
     }
 }
 
@@ -314,9 +315,13 @@ fn make_absolute(path: PathBuf) -> Result<PathBuf> {
 fn handle_send(args: SendArgs) -> Result<()> {
     let store = TaskStore::default().context("failed to locate task store")?;
     let task_id = args.task_id;
-    let prompt = args.prompt;
+    let prompt = if args.prompt.trim().is_empty() {
+        bail!("prompt must not be empty");
+    } else {
+        args.prompt
+    };
 
-    let mut metadata = match store.load_metadata(task_id.clone()) {
+    let metadata = match store.load_metadata(task_id.clone()) {
         Ok(metadata) => metadata,
         Err(err) => {
             let not_found = err
@@ -348,92 +353,36 @@ fn handle_send(args: SendArgs) -> Result<()> {
         TaskState::Stopped | TaskState::Running => {}
     }
 
-    let paths = store.task(task_id.clone());
-    metadata = paths.update_metadata(|record| {
-        record.last_prompt = Some(prompt.clone());
-        record.set_state(TaskState::Running);
-    })?;
-    let pipe_path = paths.pipe_path();
-    let mut pipe = match OpenOptions::new()
-        .write(true)
-        .custom_flags(O_NONBLOCK)
-        .open(&pipe_path)
-    {
-        Ok(file) => file,
-        Err(err) if err.kind() == ErrorKind::NotFound => {
-            bail!(missing_pipe_error(&metadata.id))
+    let paths = store.task(metadata.id.clone());
+    if let Some(pid) = paths.read_pid()? {
+        if is_process_running(pid)? {
+            bail!(
+                "task {} is currently running; wait for completion or stop it first",
+                metadata.id
+            );
         }
-        Err(err) if err.raw_os_error() == Some(ENXIO) => {
-            bail!(worker_inactive_error(&metadata.id))
-        }
-        Err(err) => {
-            return Err(err)
-                .with_context(|| format!("failed to open prompt pipe at {}", pipe_path.display()));
-        }
-    };
-
-    set_blocking(&pipe).with_context(|| {
-        format!(
-            "failed to configure prompt pipe at {} for blocking mode",
-            pipe_path.display()
-        )
-    })?;
-
-    let mut payload = prompt.into_bytes();
-    payload.push(b'\n');
-
-    if let Err(err) = pipe.write_all(&payload) {
-        if pipe_connection_lost(&err) {
-            bail!(worker_inactive_error(&metadata.id));
-        }
-        return Err(err)
-            .with_context(|| format!("failed to write prompt to {}", pipe_path.display()));
+        let _ = paths.remove_pid();
     }
 
-    if let Err(err) = pipe.flush() {
-        if pipe_connection_lost(&err) {
-            bail!(worker_inactive_error(&metadata.id));
-        }
-        return Err(err)
-            .with_context(|| format!("failed to flush prompt pipe at {}", pipe_path.display()));
+    let store_root = store.root().to_path_buf();
+    let mut request = WorkerLaunchRequest::new(store_root, prompt);
+    request.task_id = Some(metadata.id.clone());
+    request.title = metadata.title.clone();
+    if let Some(path) = metadata.config_path.as_ref() {
+        request.config_path = Some(PathBuf::from(path));
     }
+    if let Some(dir) = metadata.working_dir.as_ref() {
+        request.working_directory = Some(PathBuf::from(dir));
+    }
+
+    let mut child = spawn_worker(request).context("failed to launch worker process")?;
+    if let Some(stdout) = child.stdout.take() {
+        drop(stdout);
+    }
+    drop(child);
 
     Ok(())
 }
-
-fn missing_pipe_error(task_id: &str) -> String {
-    format!(
-        "prompt pipe for task {task_id} is missing; the worker may have STOPPED, DIED, or been ARCHIVED"
-    )
-}
-
-fn worker_inactive_error(task_id: &str) -> String {
-    format!(
-        "task {task_id} is not accepting prompts; the worker may have STOPPED, DIED, or been ARCHIVED"
-    )
-}
-
-fn pipe_connection_lost(err: &io::Error) -> bool {
-    matches!(
-        err.kind(),
-        ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
-    )
-}
-
-fn set_blocking(file: &File) -> io::Result<()> {
-    let fd = file.as_raw_fd();
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags == -1 {
-        return Err(io::Error::last_os_error());
-    }
-
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !O_NONBLOCK) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-
-    Ok(())
-}
-
 fn handle_status(args: StatusArgs) -> Result<()> {
     let format = if args.json {
         StatusFormat::Json
@@ -554,6 +503,7 @@ fn handle_archive(args: ArchiveArgs) -> Result<()> {
 fn handle_worker(args: WorkerArgs) -> Result<()> {
     let config = crate::worker::child::WorkerConfig::new(
         args.store_root,
+        args.task_id,
         args.title,
         args.prompt,
         args.config_path,
@@ -585,29 +535,17 @@ const LOG_WAIT_POLL_INTERVAL_MS: u64 = 100;
 fn stop_task(paths: &TaskPaths) -> Result<StopOutcome> {
     let pid = match paths.read_pid()? {
         Some(pid) => pid,
-        None => {
-            cleanup_task_files(paths)?;
-            return Ok(StopOutcome::AlreadyStopped);
-        }
+        None => return Ok(StopOutcome::AlreadyStopped),
     };
 
     if !is_process_running(pid)? {
-        cleanup_task_files(paths)?;
+        let _ = paths.remove_pid();
         return Ok(StopOutcome::AlreadyStopped);
     }
 
-    match send_quit_signal(paths) {
-        Ok(true) => {}
-        Ok(false) => {
-            cleanup_task_files(paths)?;
-            return Ok(StopOutcome::AlreadyStopped);
-        }
-        Err(err) => return Err(err),
-    }
-
-    wait_for_worker_shutdown(paths, pid)?;
-    cleanup_task_files(paths)?;
-
+    send_signal(pid, libc::SIGTERM)?;
+    wait_for_worker_shutdown(pid)?;
+    let _ = paths.remove_pid();
     mark_task_state(paths, TaskState::Stopped)?;
 
     Ok(StopOutcome::Stopped)
@@ -663,46 +601,34 @@ fn print_stop_outcome(task_id: &str, outcome: &StopOutcome) {
     }
 }
 
-fn send_quit_signal(paths: &TaskPaths) -> Result<bool> {
-    let pipe_path = paths.pipe_path();
-    let mut pipe = match OpenOptions::new().write(true).open(&pipe_path) {
-        Ok(pipe) => pipe,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
-        Err(err) => {
-            if err.raw_os_error() == Some(libc::ENXIO) {
-                return Ok(false);
-            }
-            return Err(err)
-                .with_context(|| format!("failed to open pipe for task {}", paths.id()));
-        }
-    };
-
-    if let Err(err) = pipe.write_all(b"/quit\n") {
-        if err.kind() != ErrorKind::BrokenPipe {
-            return Err(err)
-                .with_context(|| format!("failed to write stop signal for task {}", paths.id()));
-        }
-    }
-
-    if let Err(err) = pipe.flush() {
-        if err.kind() != ErrorKind::BrokenPipe {
-            return Err(err)
-                .with_context(|| format!("failed to flush stop signal for task {}", paths.id()));
-        }
-    }
-
-    Ok(true)
-}
-
-fn wait_for_worker_shutdown(paths: &TaskPaths, pid: i32) -> Result<()> {
+fn wait_for_worker_shutdown(pid: i32) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(SHUTDOWN_TIMEOUT_SECS);
     loop {
-        if Instant::now() >= deadline {
-            bail!("timed out waiting for task {} to stop", paths.id());
+        let mut status: libc::c_int = 0;
+        let wait_result =
+            unsafe { libc::waitpid(pid, &mut status as *mut libc::c_int, libc::WNOHANG) };
+        if wait_result == pid {
+            break;
+        } else if wait_result == 0 {
+            // child still running
+        } else if wait_result == -1 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ECHILD) {
+                if !is_process_running(pid)? {
+                    break;
+                }
+            } else {
+                return Err(err).with_context(|| format!("failed to wait for process {pid}"));
+            }
         }
 
-        if paths.read_pid()?.is_none() {
-            break;
+        if Instant::now() >= deadline {
+            send_signal(pid, libc::SIGKILL)?;
+            thread::sleep(Duration::from_millis(SHUTDOWN_POLL_INTERVAL_MS));
+            if !is_process_running(pid)? {
+                break;
+            }
+            bail!("timed out waiting for worker {pid} to stop");
         }
 
         if !is_process_running(pid)? {
@@ -714,10 +640,22 @@ fn wait_for_worker_shutdown(paths: &TaskPaths, pid: i32) -> Result<()> {
     Ok(())
 }
 
-fn cleanup_task_files(paths: &TaskPaths) -> Result<()> {
-    paths.remove_pid()?;
-    paths.remove_pipe()?;
-    Ok(())
+fn send_signal(pid: i32, signal: libc::c_int) -> Result<()> {
+    if pid <= 0 {
+        return Ok(());
+    }
+
+    let result = unsafe { libc::kill(pid, signal) };
+    if result == -1 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(err).with_context(|| format!("failed to signal process {pid}"))
+        }
+    } else {
+        Ok(())
+    }
 }
 
 fn mark_task_state(paths: &TaskPaths, state: TaskState) -> Result<()> {
@@ -1117,9 +1055,6 @@ fn read_line_retry<R: BufRead>(reader: &mut R, buffer: &mut String) -> io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader};
-    use std::os::unix::ffi::OsStrExt;
-    use std::path::Path;
     use tempfile::tempdir;
 
     #[test]
@@ -1144,53 +1079,32 @@ mod tests {
     }
 
     #[test]
-    fn stop_task_sends_quit_and_cleans_up_files() {
+    fn stop_task_terminates_running_process() {
         let tmp = tempdir().expect("tempdir");
         let store = TaskStore::new(tmp.path().join("store"));
         store.ensure_layout().expect("layout");
         let paths = store.task("task-2".to_string());
         paths.ensure_directory().expect("directory");
 
-        create_fifo(paths.pipe_path().as_path()).expect("create fifo");
-        let pid = i32::try_from(std::process::id()).expect("pid fits in i32");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleeper");
+        let pid = i32::try_from(child.id()).expect("pid fits in i32");
         paths.write_pid(pid).expect("write pid");
-
-        let pipe_path = paths.pipe_path();
-        let pid_path = paths.pid_path();
-        let reader_handle = std::thread::spawn(move || {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&pipe_path)
-                .expect("open pipe for read");
-            let mut reader = BufReader::new(file);
-            let mut line = String::new();
-            reader.read_line(&mut line).expect("read line");
-            assert_eq!(line.trim(), "/quit");
-            std::fs::remove_file(&pid_path).expect("remove pid");
-        });
+        paths
+            .write_metadata(&TaskMetadata::new(
+                "task-2".into(),
+                None,
+                TaskState::Running,
+            ))
+            .expect("write metadata");
 
         let outcome = stop_task(&paths).expect("stop task");
         assert_eq!(outcome, StopOutcome::Stopped);
 
-        reader_handle.join().expect("reader thread");
-
+        let _ = child.wait();
         assert!(!paths.pid_path().exists());
-        assert!(!paths.pipe_path().exists());
-    }
-
-    fn create_fifo(path: &Path) -> Result<()> {
-        if path.exists() {
-            std::fs::remove_file(path)?;
-        }
-        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("pipe path");
-        let mode = 0o600;
-        let result = unsafe { libc::mkfifo(c_path.as_ptr(), mode) };
-        if result != 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("failed to create fifo at {}", path.display()));
-        }
-        Ok(())
     }
 }
 enum ArchiveTaskOutcome {
