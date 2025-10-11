@@ -1319,11 +1319,7 @@ impl HumanRenderState {
                 input.saturating_sub(cached) + output
             });
 
-        let mut lines = vec!["tokens used".to_string(), format_with_separators(total)];
-        if let Some(message) = self.last_agent_message.clone() {
-            lines.push(message);
-        }
-        lines
+        vec!["tokens used".to_string(), format_with_separators(total)]
     }
 }
 

@@ -610,13 +610,17 @@ fn send_appends_prompt_to_log() {
         .map(|line| serde_json::from_str(line).expect("valid json line"))
         .collect();
 
-    assert!(events.iter().any(|event| {
-        event["type"] == "user_message" && event["message"] == "second prompt"
-    }));
+    assert!(
+        events.iter().any(|event| {
+            event["type"] == "user_message" && event["message"] == "second prompt"
+        })
+    );
     assert!(events.iter().any(|event| {
         event["type"] == "item.completed"
             && event["item"]["type"] == "agent_message"
-            && event["item"]["text"].as_str().is_some_and(|text| text.contains("second prompt"))
+            && event["item"]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("second prompt"))
     }));
 }
 
