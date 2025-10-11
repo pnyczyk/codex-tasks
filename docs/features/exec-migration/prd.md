@@ -10,7 +10,7 @@ OpenAI has deprecated the legacy `codex proto` interface in favor of `codex exec
 - Maintaining feature parity (start, send, status, log, stop, archive) is mandatory for existing power users.
 
 ## Goals & Success Metrics
-1. `codex-tasks start` launches a task that uses `codex exec` under the hood and returns the Codex `thread_id` (canonical task identifier) to the caller as soon as the first event is received.
+1. `codex-tasks start` launches a task that uses `codex exec` under the hood, requires an initial prompt, and returns the Codex `thread_id` (canonical task identifier) to the caller as soon as the first event is received.
 2. `codex-tasks send` reuses the stored session ID to issue follow-up prompts via `codex exec --json resume`.
 3. Logs, transcripts, and metadata remain usable (no format-breaking changes for downstream tooling).
 4. Full CLI test suite passes, and QA confirms parity across critical workflows (start → send → status → stop, start without prompt, stop during in-flight prompt, archive workflow).
@@ -40,7 +40,7 @@ OpenAI has deprecated the legacy `codex proto` interface in favor of `codex exec
 
 ### Worker Lifecycle
 - Replace the long-lived `codex proto` child process with on-demand `codex exec` invocations.
-- Queue prompts from the FIFO and process them sequentially, spawning a fresh `codex exec` for each prompt.
+- Require an initial prompt to bootstrap the first invocation; subsequent prompts flow through the FIFO.
 - Stream JSON events from each invocation in real time: capture `thread.started` immediately to persist the session ID, establish storage rooted at the new `thread_id`, forward buffered and subsequent events into the log, and detect completion without blocking for user-facing output.
 - Launch `codex exec` with `--output-last-message <task_id>.result.tmp` so the final assistant reply is captured asynchronously; atomically promote the file to `<task_id>.result` when the process exits.
 - Maintain graceful shutdown: if a `/quit` marker is received, wait only for the in-flight invocation to supply its session ID (if missing), then drain remaining events, skip queued prompts, mark the task `STOPPED`, and clean up files.
@@ -76,7 +76,7 @@ OpenAI has deprecated the legacy `codex proto` interface in favor of `codex exec
    - Defer filesystem initialization until a `thread.started` event is observed; once available, persist the `thread_id`, create task artifacts, flush buffered events, and announce the ID on stdout.
    - Watch for process completion to rotate the `--output-last-message` file into the canonical result path.
 3. **Metadata Changes:** Transition `TaskMetadata` and filesystem layout to key off the Codex `thread_id` without temporary identifiers, ensuring legacy tasks remain readable.
-4. **Command Adjustments:** Ensure `start`, `send`, `stop`, `status`, and `log` continue to function using the new identifiers. `stop` should interrupt pending prompts cleanly without leaving zombie invocations.
+4. **Command Adjustments:** Ensure `start`, `send`, `stop`, `status`, and `log` continue to function using the new identifiers, and surface a clear error when `start` is invoked without a prompt. `stop` should interrupt pending prompts cleanly without leaving zombie invocations.
 5. **Testing:** Create or update integration tests that mock `codex exec` output. Validate start→send→stop and error surfaces. Add negative tests for missing session ID on resume.
 6. **Documentation & Release Notes:** Update `README.md`, `docs/prd.md`, and `CHANGELOG.md`. Provide migration guidance and troubleshooting tips.
 

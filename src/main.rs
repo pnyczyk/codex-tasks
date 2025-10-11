@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, ErrorKind, Write};
+use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -58,6 +58,7 @@ fn handle_start(args: StartArgs) -> Result<()> {
         repo_ref,
     } = args;
 
+    let prompt = resolve_start_prompt(prompt)?;
     let config_file = resolve_config_file(config_file)?;
     let working_dir = prepare_working_directory(working_dir, repo.as_deref(), repo_ref.as_deref())?;
 
@@ -66,32 +67,78 @@ fn handle_start(args: StartArgs) -> Result<()> {
         .ensure_layout()
         .context("failed to prepare task store layout")?;
 
-    let task_id = store.generate_task_id();
-    let task_paths = store.task(task_id.clone());
-
-    let initial_state = if prompt.is_some() {
-        TaskState::Running
-    } else {
-        TaskState::Idle
-    };
-    let mut metadata = TaskMetadata::new(task_id.clone(), title.clone(), initial_state);
-    metadata.initial_prompt = prompt.clone();
-    metadata.last_prompt = prompt.clone();
-
-    store
-        .save_metadata(&metadata)
-        .with_context(|| format!("failed to persist metadata for task {task_id}"))?;
-
-    let mut request = WorkerLaunchRequest::new(task_paths);
+    let mut request = WorkerLaunchRequest::new(store.root().to_path_buf(), prompt);
     request.title = title;
-    request.prompt = prompt;
     request.config_path = config_file;
     request.working_directory = working_dir;
-    let _child = spawn_worker(request).context("failed to launch worker process")?;
 
-    println!("{task_id}");
+    let mut child = spawn_worker(request).context("failed to launch worker process")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("worker did not expose stdout for handshake")?;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        let result = reader
+            .read_line(&mut line)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| {
+                if bytes == 0 {
+                    Err(anyhow!("worker exited before publishing thread id"))
+                } else {
+                    Ok(line.trim().to_string())
+                }
+            });
+        let _ = tx.send(result);
+    });
+
+    let thread_id = match rx.recv_timeout(Duration::from_secs(60)) {
+        Ok(Ok(id)) if !id.is_empty() => id,
+        Ok(Ok(_)) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("worker returned empty thread identifier");
+        }
+        Ok(Err(err)) => {
+            let _ = child.kill();
+            if let Ok(status) = child.wait() {
+                bail!("failed to start worker: {err:#}. worker exited with {status}");
+            } else {
+                bail!("failed to start worker: {err:#}");
+            }
+        }
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("timed out waiting for worker to publish thread id");
+        }
+    };
+
+    drop(child);
+
+    println!("{thread_id}");
 
     Ok(())
+}
+
+fn resolve_start_prompt(raw_prompt: String) -> Result<String> {
+    if raw_prompt == "-" {
+        let mut buffer = String::new();
+        io::stdin()
+            .read_to_string(&mut buffer)
+            .context("failed to read prompt from stdin")?;
+        if buffer.trim().is_empty() {
+            bail!("no prompt provided via stdin");
+        }
+        Ok(buffer)
+    } else if raw_prompt.trim().is_empty() {
+        bail!("prompt must not be empty");
+    } else {
+        Ok(raw_prompt)
+    }
 }
 
 fn resolve_config_file(path: Option<PathBuf>) -> Result<Option<PathBuf>> {
@@ -295,13 +342,10 @@ fn handle_send(args: SendArgs) -> Result<()> {
                 metadata.id
             )
         }
-        TaskState::Stopped => {
-            bail!("task {} is STOPPED and cannot receive prompts", metadata.id)
-        }
         TaskState::Died => {
             bail!("task {} has DIED and cannot receive prompts", metadata.id)
         }
-        TaskState::Idle | TaskState::Running => {}
+        TaskState::Stopped | TaskState::Running => {}
     }
 
     let paths = store.task(task_id.clone());
@@ -509,7 +553,6 @@ fn handle_archive(args: ArchiveArgs) -> Result<()> {
 
 fn handle_worker(args: WorkerArgs) -> Result<()> {
     let config = crate::worker::child::WorkerConfig::new(
-        args.task_id,
         args.store_root,
         args.title,
         args.prompt,
@@ -571,22 +614,26 @@ fn stop_task(paths: &TaskPaths) -> Result<StopOutcome> {
 }
 
 fn stop_all_idle_tasks(store: &TaskStore) -> Result<()> {
-    let mut idle = Vec::new();
+    let mut running = Vec::new();
     for task in collect_active_tasks(store)? {
-        if task.metadata.state == TaskState::Idle {
-            idle.push(task.metadata.id.clone());
+        let paths = store.task(task.metadata.id.clone());
+        let pid = paths.read_pid()?;
+        if let Some(pid) = pid {
+            if is_process_running(pid)? {
+                running.push(task.metadata.id.clone());
+            }
         }
     }
 
-    if idle.is_empty() {
-        println!("No idle tasks to stop.");
+    if running.is_empty() {
+        println!("No running tasks to stop.");
         return Ok(());
     }
 
     let mut stopped = 0usize;
     let mut already = 0usize;
 
-    for task_id in idle {
+    for task_id in running {
         let paths = store.task(task_id.clone());
         let outcome = stop_task(&paths)?;
         print_stop_outcome(&task_id, &outcome);
@@ -597,7 +644,7 @@ fn stop_all_idle_tasks(store: &TaskStore) -> Result<()> {
     }
 
     println!(
-        "Stopped {stopped} idle task(s); {already} already stopped.",
+        "Stopped {stopped} running task(s); {already} already stopped.",
         stopped = stopped,
         already = already
     );
@@ -954,25 +1001,23 @@ fn follow_log(reader: &mut BufReader<File>, context: FollowContext) -> Result<()
                 }
 
                 match context.current_state() {
-                    Ok(Some(TaskState::Idle)) => {
+                    Ok(Some(TaskState::Running)) => {
+                        idle_pending = false;
+                    }
+                    Ok(Some(TaskState::Stopped)) => {
                         if idle_pending {
-                            eprintln!("Task {} is IDLE; stopping log follow.", context.task_id);
+                            eprintln!("Task {} is STOPPED; stopping log follow.", context.task_id);
                             break;
                         }
                         idle_pending = true;
                     }
-                    Ok(Some(
-                        state @ (TaskState::Stopped | TaskState::Died | TaskState::Archived),
-                    )) => {
+                    Ok(Some(state @ (TaskState::Died | TaskState::Archived))) => {
                         eprintln!(
                             "Task {} is {}; stopping log follow.",
                             context.task_id,
                             state.as_str()
                         );
                         break;
-                    }
-                    Ok(Some(TaskState::Running)) => {
-                        idle_pending = false;
                     }
                     Ok(None) => {
                         eprintln!(
@@ -1232,7 +1277,7 @@ fn archive_all_tasks(store: &TaskStore) -> Result<()> {
             TaskState::Stopped | TaskState::Died => {
                 candidates.push(task.metadata.id.clone());
             }
-            TaskState::Running | TaskState::Idle => {
+            TaskState::Running => {
                 skipped.push((task.metadata.id.clone(), task.metadata.state));
             }
             TaskState::Archived => {}

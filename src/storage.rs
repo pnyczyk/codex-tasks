@@ -7,7 +7,6 @@ use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Datelike, Utc};
 use dirs::home_dir;
 use tempfile::NamedTempFile;
-use uuid::Uuid;
 
 use crate::task::{TaskId, TaskMetadata};
 
@@ -88,11 +87,6 @@ impl TaskStore {
         fs::create_dir_all(&dir)
             .with_context(|| format!("failed to create archive directory for task {}", task_id))?;
         Ok(dir)
-    }
-
-    /// Generates a new random identifier for a task.
-    pub fn generate_task_id(&self) -> TaskId {
-        Uuid::new_v4().to_string()
     }
 
     /// Returns helpers for interacting with an active task's files.
@@ -389,7 +383,7 @@ mod tests {
         let metadata = TaskMetadata::new(
             id.clone(),
             Some("Example".into()),
-            crate::task::TaskState::Idle,
+            crate::task::TaskState::Stopped,
         );
         files.write_metadata(&metadata).expect("write metadata");
         let loaded = files.read_metadata().expect("read metadata");

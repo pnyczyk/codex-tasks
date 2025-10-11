@@ -155,21 +155,17 @@ fn load_status_record(store: &TaskStore, task_id: &str) -> Result<TaskStatusReco
 }
 
 pub(crate) fn derive_active_state(metadata_state: &TaskState, pid: Option<i32>) -> TaskState {
-    match pid {
-        Some(pid) => {
-            if is_process_running(pid) {
-                match metadata_state {
-                    TaskState::Idle => TaskState::Idle,
-                    TaskState::Running | TaskState::Died => TaskState::Running,
-                    TaskState::Stopped => TaskState::Running,
-                    TaskState::Archived => TaskState::Archived,
-                }
-            } else {
-                derive_state_without_pid(metadata_state.clone())
-            }
+    if let Some(pid) = pid {
+        if is_process_running(pid) {
+            return match metadata_state {
+                TaskState::Running => TaskState::Running,
+                TaskState::Stopped => TaskState::Stopped,
+                TaskState::Archived => TaskState::Archived,
+                TaskState::Died => TaskState::Running,
+            };
         }
-        None => derive_state_without_pid(metadata_state.clone()),
     }
+    derive_state_without_pid(metadata_state.clone())
 }
 
 fn derive_state_without_pid(metadata_state: TaskState) -> TaskState {

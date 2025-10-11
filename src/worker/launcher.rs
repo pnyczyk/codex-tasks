@@ -3,28 +3,26 @@ use std::process::{Child, Command, Stdio};
 
 use anyhow::{Context, Result};
 
-use crate::storage::TaskPaths;
-
 use super::child::{PROMPT_ENV_VAR, TITLE_ENV_VAR};
 
 /// Parameters required to spawn a detached worker process.
 #[derive(Debug)]
 pub struct WorkerLaunchRequest {
-    pub task_paths: TaskPaths,
+    pub store_root: PathBuf,
     pub title: Option<String>,
-    pub prompt: Option<String>,
+    pub prompt: String,
     pub executable: Option<PathBuf>,
     pub config_path: Option<PathBuf>,
     pub working_directory: Option<PathBuf>,
 }
 
 impl WorkerLaunchRequest {
-    /// Creates a request for the provided task paths with no optional metadata.
-    pub fn new(task_paths: TaskPaths) -> Self {
+    /// Creates a request for the provided store root and prompt with no optional metadata.
+    pub fn new(store_root: PathBuf, prompt: String) -> Self {
         Self {
-            task_paths,
+            store_root,
             title: None,
-            prompt: None,
+            prompt,
             executable: None,
             config_path: None,
             working_directory: None,
@@ -35,15 +33,13 @@ impl WorkerLaunchRequest {
 /// Spawns a detached worker process based on the provided request.
 pub fn spawn_worker(request: WorkerLaunchRequest) -> Result<Child> {
     let WorkerLaunchRequest {
-        task_paths,
+        store_root,
         title,
         prompt,
         executable,
         config_path,
         working_directory,
     } = request;
-
-    task_paths.ensure_directory()?;
 
     let exe = match executable {
         Some(path) => path,
@@ -52,23 +48,14 @@ pub fn spawn_worker(request: WorkerLaunchRequest) -> Result<Child> {
 
     let mut command = Command::new(exe);
     command.arg("worker");
-    command.arg("--task-id");
-    command.arg(task_paths.id());
     command.arg("--store-root");
-    let store_root = task_paths
-        .directory()
-        .parent()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| task_paths.directory().to_path_buf());
-    command.arg(store_root);
+    command.arg(&store_root);
 
     if let Some(title) = title {
         command.env(TITLE_ENV_VAR, title);
     }
 
-    if let Some(prompt) = prompt {
-        command.env(PROMPT_ENV_VAR, prompt);
-    }
+    command.env(PROMPT_ENV_VAR, &prompt);
 
     if let Some(config_path) = config_path {
         command.arg("--config-path");
@@ -81,7 +68,7 @@ pub fn spawn_worker(request: WorkerLaunchRequest) -> Result<Child> {
     }
 
     command.stdin(Stdio::null());
-    command.stdout(Stdio::null());
+    command.stdout(Stdio::piped());
     command.stderr(Stdio::null());
 
     command.spawn().context("failed to spawn worker process")

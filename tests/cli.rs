@@ -4,12 +4,14 @@ use std::ffi::{CString, OsString};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[path = "util.rs"]
+mod util;
 
 use assert_cmd::Command;
 use assert_cmd::cargo::cargo_bin;
@@ -182,7 +184,7 @@ fn ls_excludes_archived_by_default() {
     fs::create_dir_all(&archive_root).expect("layout");
 
     let active_id = "task-active";
-    write_metadata(&task_root, active_id, "IDLE");
+    write_metadata(&task_root, active_id, "RUNNING");
 
     let archived_id = "task-archived";
     let archived_dir = archive_root
@@ -289,7 +291,7 @@ fn ls_accepts_multiple_states() {
     let archive_root = task_root.join("archive");
     fs::create_dir_all(&archive_root).expect("layout");
 
-    write_metadata(&task_root, "task-idle", "IDLE");
+    write_metadata(&task_root, "task-stopped", "STOPPED");
     write_metadata(&task_root, "task-running", "RUNNING");
     let pid = i32::try_from(std::process::id()).expect("pid fits");
     fs::write(
@@ -327,27 +329,27 @@ fn ls_accepts_multiple_states() {
         .success()
         .stdout(predicates::str::contains("task-running"))
         .stdout(predicates::str::contains("task-archived"))
-        .stdout(predicates::str::contains("task-idle").not());
+        .stdout(predicates::str::contains("task-stopped").not());
 }
 
 #[test]
-fn ls_reports_idle_with_live_worker() {
+fn ls_reports_running_with_live_worker() {
     let home = tempdir().expect("tempdir");
     let task_root = home.path().join(".codex").join("tasks");
     fs::create_dir_all(&task_root).expect("layout");
 
-    let task_id = "task-idle";
-    write_metadata(&task_root, task_id, "IDLE");
+    let task_id = "task-running";
+    write_metadata(&task_root, task_id, "RUNNING");
     let pid = i32::try_from(std::process::id()).expect("pid fits in i32");
     fs::write(task_root.join(task_id).join("task.pid"), pid.to_string()).expect("write pid");
 
     let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
-    cmd.env("HOME", home.path()).args(["ls", "--state", "IDLE"]);
+    cmd.env("HOME", home.path())
+        .args(["ls", "--state", "RUNNING"]);
     cmd.assert()
         .success()
-        .stdout(predicates::str::contains("task-idle"))
-        .stdout(predicates::str::contains("IDLE"))
-        .stdout(predicates::str::contains("RUNNING").not());
+        .stdout(predicates::str::contains("task-running"))
+        .stdout(predicates::str::contains("RUNNING"));
 }
 
 #[test]
@@ -359,8 +361,7 @@ fn start_command_creates_task_and_launches_worker() {
         .arg("--title")
         .arg("Integration Title")
         .arg("Initial prompt")
-        .env("HOME", tmp.path())
-        .env("CODEX_TASKS_EXIT_AFTER_START", "1");
+        .env("HOME", tmp.path());
     let assert = cmd.assert().success();
     let output = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
     let task_id = output.trim();
@@ -403,24 +404,14 @@ fn start_command_creates_task_and_launches_worker() {
 }
 
 #[test]
-fn start_without_prompt_sets_idle_state() {
+fn start_without_prompt_fails() {
     let tmp = tempdir().expect("tempdir");
 
     let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
-    cmd.arg("start")
-        .env("HOME", tmp.path())
-        .env("CODEX_TASKS_EXIT_AFTER_START", "1");
-    let assert = cmd.assert().success();
-    let output = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
-    let task_id = output.trim();
-    assert!(!task_id.is_empty(), "start should print the task id");
-
-    let store_root = tmp.path().join(".codex").join("tasks");
-    let metadata_path = store_root.join(task_id).join("task.json");
-    let metadata: Value =
-        serde_json::from_str(&fs::read_to_string(&metadata_path).expect("read metadata"))
-            .expect("parse metadata");
-    assert_eq!(metadata["state"], "IDLE");
+    cmd.arg("start").env("HOME", tmp.path());
+    cmd.assert()
+        .failure()
+        .stderr(predicates::str::contains("<PROMPT>"));
 }
 
 #[test]
@@ -433,7 +424,7 @@ fn start_requires_working_dir_when_repo_specified() {
         .arg("--repo")
         .arg(source_repo.path())
         .env("HOME", home.path())
-        .env("CODEX_TASKS_EXIT_AFTER_START", "1");
+        .arg("prompt");
     cmd.assert()
         .failure()
         .stderr(predicates::str::contains("--working-dir"));
@@ -458,7 +449,7 @@ fn start_with_repo_ref_clones_branch_into_working_dir() {
         .arg("--repo-ref")
         .arg("feature")
         .env("HOME", home.path())
-        .env("CODEX_TASKS_EXIT_AFTER_START", "1");
+        .arg("prompt");
     let assert = cmd.assert().success();
     let task_id = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
     assert!(!task_id.trim().is_empty(), "start should print a task id");
@@ -488,7 +479,7 @@ fn start_rejects_custom_config_with_wrong_filename() {
         .arg("--config-file")
         .arg(&config_path)
         .env("HOME", home.path())
-        .env("CODEX_TASKS_EXIT_AFTER_START", "1");
+        .arg("prompt");
     cmd.assert().failure().stderr(predicates::str::contains(
         "custom config file must be named",
     ));
@@ -511,7 +502,7 @@ fn start_clones_local_repo_using_relative_path() {
         .arg("--repo")
         .arg("./local_repo")
         .env("HOME", home.path())
-        .env("CODEX_TASKS_EXIT_AFTER_START", "1");
+        .arg("prompt");
     let assert = cmd.assert().success();
     let task_id = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
     assert!(!task_id.trim().is_empty(), "start should print a task id");
@@ -535,7 +526,7 @@ fn start_accepts_custom_config_named_config_toml() {
         .arg("--config-file")
         .arg(&config_path)
         .env("HOME", home.path())
-        .env("CODEX_TASKS_EXIT_AFTER_START", "1");
+        .arg("prompt");
     cmd.assert().success();
 }
 
@@ -563,7 +554,7 @@ fn send_rejects_stopped_tasks() {
     cmd.env("HOME", tmp.path())
         .args(["send", task_id, "prompt"]);
     cmd.assert().failure().stderr(predicates::str::contains(
-        "task stopped-task is STOPPED and cannot receive prompts",
+        "prompt pipe for task stopped-task is missing",
     ));
 }
 
@@ -627,7 +618,7 @@ fn send_writes_prompt_to_pipe() {
     fs::create_dir_all(&tasks_dir).expect("tasks dir");
 
     let task_id = "active-task";
-    write_metadata(&tasks_dir, task_id, "IDLE");
+    write_metadata(&tasks_dir, task_id, "STOPPED");
     let pipe_path = tasks_dir.join(task_id).join("task.pipe");
     create_pipe(&pipe_path);
 
@@ -667,7 +658,7 @@ fn send_errors_when_pipe_missing() {
     fs::create_dir_all(&tasks_dir).expect("tasks dir");
 
     let task_id = "missing-pipe-task";
-    write_metadata(&tasks_dir, task_id, "IDLE");
+    write_metadata(&tasks_dir, task_id, "STOPPED");
 
     let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
     cmd.env("HOME", tmp.path())
@@ -686,7 +677,7 @@ fn send_errors_when_pipe_has_no_reader() {
     fs::create_dir_all(&tasks_dir).expect("tasks dir");
 
     let task_id = "no-reader-task";
-    write_metadata(&tasks_dir, task_id, "IDLE");
+    write_metadata(&tasks_dir, task_id, "STOPPED");
     let pipe_path = tasks_dir.join(task_id).join("task.pipe");
     create_pipe(&pipe_path);
 
@@ -711,33 +702,33 @@ fn stop_handles_missing_task_gracefully() {
 }
 
 #[test]
-fn stop_all_stops_idle_tasks() {
+fn stop_all_stops_running_tasks() {
     let env = IntegrationTestEnv::new();
     let first = env.start_task("Idle One", "prompt one");
     let second = env.start_task("Idle Two", "prompt two");
 
-    env.wait_for_condition(&first, |value| value["state"] == "IDLE");
-    env.wait_for_condition(&second, |value| value["state"] == "IDLE");
+    env.wait_for_condition(&first, |value| value["state"] == "STOPPED");
+    env.wait_for_condition(&second, |value| value["state"] == "STOPPED");
 
     let mut cmd = env.command();
     let assert = cmd.args(["stop", "-a"]).assert().success();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
     assert!(stdout.contains(&format!("Task {} stopped.", first)));
     assert!(stdout.contains(&format!("Task {} stopped.", second)));
-    assert!(stdout.contains("Stopped 2 idle task(s); 0 already stopped."));
+    assert!(stdout.contains("Stopped 2 running task(s); 0 already stopped."));
 
     env.wait_for_condition(&first, |value| value["state"] == "STOPPED");
     env.wait_for_condition(&second, |value| value["state"] == "STOPPED");
 }
 
 #[test]
-fn stop_all_reports_when_no_idle_tasks_found() {
+fn stop_all_reports_when_no_running_tasks_found() {
     let tmp = tempdir().expect("tempdir");
     let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
     cmd.env("HOME", tmp.path()).args(["stop", "--all"]);
     cmd.assert()
         .success()
-        .stdout(predicates::str::contains("No idle tasks to stop."));
+        .stdout(predicates::str::contains("No running tasks to stop."));
 }
 
 #[test]
@@ -898,7 +889,7 @@ fn end_to_end_task_lifecycle_flow() {
     let task_id = env.start_task("Lifecycle Task", "first prompt");
 
     let record = env.wait_for_condition(&task_id, |value| {
-        value["state"] == "IDLE" && value["last_result"].as_str().is_some()
+        value["state"] == "STOPPED" && value["last_result"].as_str().is_some()
     });
     assert_eq!(record["last_result"], "response 1: first prompt");
     assert_eq!(record["last_prompt"], "first prompt");
@@ -908,7 +899,7 @@ fn end_to_end_task_lifecycle_flow() {
     send.assert().success();
 
     let record = env.wait_for_condition(&task_id, |value| {
-        value["state"] == "IDLE" && value["last_result"] == "response 2: second prompt"
+        value["state"] == "STOPPED" && value["last_result"] == "response 2: second prompt"
     });
     assert_eq!(record["last_prompt"], "second prompt");
 
@@ -916,7 +907,7 @@ fn end_to_end_task_lifecycle_flow() {
     status.args(["status", "--json", &task_id]);
     let output = status.assert().success().get_output().stdout.clone();
     let value: Value = serde_json::from_slice(&output).expect("valid json");
-    assert_eq!(value["state"], "IDLE");
+    assert_eq!(value["state"], "STOPPED");
     assert_eq!(value["last_result"], "response 2: second prompt");
     assert_eq!(value["location"], "active");
 
@@ -963,74 +954,6 @@ fn status_reports_died_after_worker_killed() {
     assert_eq!(died["last_prompt"], "initial prompt");
 }
 
-const FAKE_CODEX_SCRIPT: &str = r#"#!/usr/bin/env python3
-import json
-import os
-import sys
-import time
-
-ROOT = os.path.abspath(os.environ.get("FAKE_CODEX_ROOT", "."))
-DELAY_MS = int(os.environ.get("FAKE_CODEX_DELAY_MS", "0"))
-
-
-def send(event):
-    sys.stdout.write(json.dumps(event) + "\n")
-    sys.stdout.flush()
-
-
-send(
-    {
-        "id": "sub-0000000000",
-        "msg": {
-            "type": "session_configured",
-            "session_id": "00000000-0000-0000-0000-000000000000",
-            "model": "fake-model",
-            "history_log_id": 0,
-            "history_entry_count": 0,
-            "rollout_path": os.path.join(ROOT, "rollout.json"),
-        },
-    }
-)
-
-turn = 0
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    data = json.loads(line)
-    submission_id = data.get("id", "sub-unknown")
-    op = data.get("op", {})
-    op_type = op.get("type")
-    if op_type == "user_input":
-        parts = []
-        for item in op.get("items", []):
-            if item.get("type") == "text":
-                parts.append(item.get("text", ""))
-        prompt = " ".join(parts)
-        turn += 1
-        response = f"response {turn}: {prompt}"
-        send({"id": submission_id, "msg": {"type": "task_started", "model_context_window": None}})
-        if DELAY_MS > 0:
-            time.sleep(DELAY_MS / 1000.0)
-        send({"id": submission_id, "msg": {"type": "agent_message", "message": response}})
-        send(
-            {
-                "id": submission_id,
-                "msg": {"type": "task_complete", "last_agent_message": response},
-            }
-        )
-    elif op_type == "shutdown":
-        send({"id": submission_id, "msg": {"type": "shutdown_complete"}})
-        break
-    else:
-        send(
-            {
-                "id": submission_id,
-                "msg": {"type": "error", "message": f"unsupported op {op_type}"},
-            }
-        )
-"#;
-
 struct IntegrationTestEnv {
     home: TempDir,
     path: OsString,
@@ -1049,7 +972,7 @@ impl IntegrationTestEnv {
     fn with_optional_delay(delay_ms: Option<u64>) -> Self {
         let home = tempdir().expect("tempdir");
         let bin_dir = home.path().join("bin");
-        write_fake_codex(&bin_dir);
+        util::write_fake_codex(&bin_dir);
 
         let base_path = std::env::var_os("PATH").unwrap_or_else(|| OsString::from(""));
         let mut path = OsString::new();
@@ -1135,17 +1058,6 @@ impl IntegrationTestEnv {
     }
 }
 
-fn write_fake_codex(bin_dir: &Path) {
-    fs::create_dir_all(bin_dir).expect("bin dir");
-    let script_path = bin_dir.join("codex");
-    fs::write(&script_path, FAKE_CODEX_SCRIPT).expect("write fake codex script");
-    let mut perms = fs::metadata(&script_path)
-        .expect("script metadata")
-        .permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&script_path, perms).expect("set permissions");
-}
-
 fn write_metadata(tasks_dir: &Path, task_id: &str, state: &str) {
     let task_dir = tasks_dir.join(task_id);
     fs::create_dir_all(&task_dir).expect("task directory");
@@ -1200,7 +1112,7 @@ fn find_task_directory(root: &Path, task_id: &str) -> Option<PathBuf> {
 }
 
 #[test]
-fn status_reports_idle_task_in_json() {
+fn status_reports_stopped_task_in_json() {
     let temp = TempDir::new().expect("temp dir");
     let home = temp.path();
     let task_id = "task-123";
@@ -1211,7 +1123,7 @@ fn status_reports_idle_task_in_json() {
     let metadata = serde_json::json!({
         "id": task_id,
         "title": "Example task",
-        "state": "IDLE",
+        "state": "STOPPED",
         "created_at": created_at,
         "updated_at": created_at
     });
@@ -1227,7 +1139,7 @@ fn status_reports_idle_task_in_json() {
     let value: Value = serde_json::from_slice(&output).expect("valid json");
     assert_eq!(value["id"], task_id);
     assert_eq!(value["title"], "Example task");
-    assert_eq!(value["state"], "IDLE");
+    assert_eq!(value["state"], "STOPPED");
     assert_eq!(value["location"], "active");
     assert_eq!(value["pid"], Value::Null);
     assert_eq!(value["last_prompt"], Value::Null);
@@ -1394,7 +1306,7 @@ fn log_reads_archived_tasks() {
 }
 
 #[test]
-fn log_follow_exits_when_task_idle() {
+fn log_follow_exits_when_task_stopped() {
     let home = tempdir().expect("tempdir");
     let task_dir = home.path().join(".codex").join("tasks").join("task-idle");
     fs::create_dir_all(&task_dir).expect("create dirs");
@@ -1403,7 +1315,7 @@ fn log_follow_exits_when_task_idle() {
     write_metadata(
         &home.path().join(".codex").join("tasks"),
         "task-idle",
-        "IDLE",
+        "STOPPED",
     );
 
     let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
@@ -1417,8 +1329,8 @@ fn log_follow_exits_when_task_idle() {
     assert_eq!(stdout, "first line\nsecond line\n");
     let stderr = String::from_utf8(assert.get_output().stderr.clone()).expect("stderr utf8");
     assert!(
-        stderr.contains("IDLE"),
-        "expected stderr to mention idle completion, got: {stderr}"
+        stderr.contains("STOPPED"),
+        "expected stderr to mention stopped completion, got: {stderr}"
     );
 }
 
@@ -1429,7 +1341,7 @@ fn log_follow_waits_for_log_file_creation() {
     let task_id = "task-wait";
     let task_dir = tasks_root.join(task_id);
     fs::create_dir_all(&task_dir).expect("task dir");
-    write_metadata(&tasks_root, task_id, "IDLE");
+    write_metadata(&tasks_root, task_id, "STOPPED");
 
     let log_path = task_dir.join("task.log");
     let writer = thread::spawn({
@@ -1511,7 +1423,7 @@ fn log_forever_flag_waits_for_manual_interrupt() {
     write_metadata(
         &home.path().join(".codex").join("tasks"),
         "task-forever",
-        "IDLE",
+        "STOPPED",
     );
 
     let binary = cargo_bin(BIN);

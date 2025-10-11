@@ -11,8 +11,6 @@ pub type TaskId = String;
 #[derive(Clone, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum TaskState {
-    #[value(name = "IDLE")]
-    Idle,
     #[value(name = "RUNNING")]
     Running,
     #[value(name = "STOPPED")]
@@ -27,7 +25,6 @@ impl TaskState {
     /// Returns the canonical uppercase representation for this state.
     pub fn as_str(&self) -> &'static str {
         match self {
-            TaskState::Idle => "IDLE",
             TaskState::Running => "RUNNING",
             TaskState::Stopped => "STOPPED",
             TaskState::Archived => "ARCHIVED",
