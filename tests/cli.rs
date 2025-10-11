@@ -349,21 +349,21 @@ fn ls_reports_running_with_live_worker() {
 
 #[test]
 fn start_command_creates_task_and_launches_worker() {
-    let tmp = tempdir().expect("tempdir");
+    let env = IntegrationTestEnv::new();
 
-    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    let mut cmd = env.command();
     cmd.arg("start")
         .arg("--title")
         .arg("Integration Title")
         .arg("Initial prompt")
-        .env("HOME", tmp.path());
+        .env("HOME", env.home.path());
     let assert = cmd.assert().success();
     let output = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
     let task_id = output.trim();
     assert!(!task_id.is_empty(), "start should print the task id");
     Uuid::parse_str(task_id).expect("task id should be a valid uuid");
 
-    let store_root = tmp.path().join(".codex").join("tasks");
+    let store_root = env.tasks_root();
     let task_dir = store_root.join(task_id);
     let metadata_path = task_dir.join("task.json");
     assert!(
@@ -427,13 +427,13 @@ fn start_requires_working_dir_when_repo_specified() {
 
 #[test]
 fn start_with_repo_ref_clones_branch_into_working_dir() {
-    let home = tempdir().expect("tempdir");
+    let env = IntegrationTestEnv::new();
     let repo_src = tempdir().expect("tempdir");
     init_repo_with_feature_branch(repo_src.path());
 
-    let working_dir = home.path().join("workspace").join("cloned");
+    let working_dir = env.home.path().join("workspace").join("cloned");
 
-    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    let mut cmd = env.command();
     cmd.arg("start")
         .arg("--title")
         .arg("Repo Task")
@@ -443,7 +443,6 @@ fn start_with_repo_ref_clones_branch_into_working_dir() {
         .arg(repo_src.path())
         .arg("--repo-ref")
         .arg("feature")
-        .env("HOME", home.path())
         .arg("prompt");
     let assert = cmd.assert().success();
     let task_id = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
@@ -482,21 +481,20 @@ fn start_rejects_custom_config_with_wrong_filename() {
 
 #[test]
 fn start_clones_local_repo_using_relative_path() {
-    let home = tempdir().expect("tempdir");
-    let repo_dir = home.path().join("local_repo");
+    let env = IntegrationTestEnv::new();
+    let repo_dir = env.home.path().join("local_repo");
     fs::create_dir_all(&repo_dir).expect("repo dir");
     init_repo_with_feature_branch(&repo_dir);
 
-    let working_dir = home.path().join("workspace").join("clone");
+    let working_dir = env.home.path().join("workspace").join("clone");
 
-    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
-    cmd.current_dir(home.path())
+    let mut cmd = env.command();
+    cmd.current_dir(env.home.path())
         .arg("start")
         .arg("--working-dir")
         .arg(&working_dir)
         .arg("--repo")
         .arg("./local_repo")
-        .env("HOME", home.path())
         .arg("prompt");
     let assert = cmd.assert().success();
     let task_id = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
@@ -510,17 +508,16 @@ fn start_clones_local_repo_using_relative_path() {
 
 #[test]
 fn start_accepts_custom_config_named_config_toml() {
-    let home = tempdir().expect("tempdir");
-    let config_dir = home.path().join("config");
+    let env = IntegrationTestEnv::new();
+    let config_dir = env.home.path().join("config");
     fs::create_dir_all(&config_dir).expect("config dir");
     let config_path = config_dir.join("config.toml");
     fs::write(&config_path, "model = \"o3\"").expect("write config");
 
-    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    let mut cmd = env.command();
     cmd.arg("start")
         .arg("--config-file")
         .arg(&config_path)
-        .env("HOME", home.path())
         .arg("prompt");
     cmd.assert().success();
 }
