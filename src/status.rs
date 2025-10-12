@@ -5,7 +5,7 @@ use serde_json::json;
 
 use crate::storage::TaskStore;
 use crate::task::{TaskId, TaskMetadata, TaskState};
-use crate::timefmt::format_unix_style;
+use crate::timefmt::{TimeFormat, format_time};
 
 /// Output format supported by the status command.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -19,15 +19,17 @@ pub enum StatusFormat {
 pub struct StatusCommandOptions {
     pub task_id: TaskId,
     pub format: StatusFormat,
+    pub time_format: TimeFormat,
 }
 
 /// Executes the status command with the provided options.
 pub fn run(options: StatusCommandOptions) -> Result<()> {
     let store = TaskStore::default()?;
     let status = load_status_record(&store, &options.task_id)?;
+    let time_format = options.time_format;
 
     match options.format {
-        StatusFormat::Human => render_human(&status),
+        StatusFormat::Human => render_human(&status, time_format),
         StatusFormat::Json => render_json(&status)?,
     }
 
@@ -40,7 +42,7 @@ struct TaskStatusRecord {
     pid: Option<i32>,
 }
 
-fn render_human(record: &TaskStatusRecord) {
+fn render_human(record: &TaskStatusRecord, time_format: TimeFormat) {
     println!("Task ID: {}", record.metadata.id);
     if let Some(title) = &record.metadata.title {
         println!("Title: {}", title);
@@ -48,11 +50,11 @@ fn render_human(record: &TaskStatusRecord) {
     println!("State: {}", record.metadata.state);
     println!(
         "Created At: {}",
-        format_unix_style(record.metadata.created_at)
+        format_time(record.metadata.created_at, time_format)
     );
     println!(
         "Updated At: {}",
-        format_unix_style(record.metadata.updated_at)
+        format_time(record.metadata.updated_at, time_format)
     );
     match record.metadata.working_dir.as_deref() {
         Some(dir) => println!("Working Dir: {}", dir),

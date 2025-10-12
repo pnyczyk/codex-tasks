@@ -2,7 +2,7 @@ use anyhow::Result;
 
 use crate::cli::LsArgs;
 use crate::commands::tasks::{collect_active_tasks, collect_archived_tasks};
-use crate::timefmt::format_unix_style;
+use crate::timefmt::{TimeFormat, format_time};
 
 pub fn handle_ls(args: LsArgs) -> Result<()> {
     let store = crate::storage::TaskStore::default()?;
@@ -27,18 +27,36 @@ pub fn handle_ls(args: LsArgs) -> Result<()> {
         return Ok(());
     }
 
+    let time_format = args.time_format;
+    let time_width = match time_format {
+        TimeFormat::Human => 24,
+        TimeFormat::Iso => 25,
+    };
+
     println!(
-        "{:<36}  {:<20}  {:<10}  {:<25}  {:<25}  {}",
-        "ID", "Title", "State", "Created At", "Updated At", "Working Dir"
+        "{:<36} {:<20} {:<10} {:<width$} {:<width$} {}",
+        "ID",
+        "Title",
+        "State",
+        "Created At",
+        "Updated At",
+        "Working Dir",
+        width = time_width
     );
     for entry in tasks {
         let title = entry.metadata.title.as_deref().unwrap_or("-");
-        let created = format_unix_style(entry.metadata.created_at);
-        let updated = format_unix_style(entry.metadata.updated_at);
+        let created = format_time(entry.metadata.created_at, time_format);
+        let updated = format_time(entry.metadata.updated_at, time_format);
         let working_dir = entry.metadata.working_dir.as_deref().unwrap_or("-");
         println!(
-            "{:<36}  {:<20}  {:<10}  {:<25}  {:<25}  {}",
-            entry.metadata.id, title, entry.metadata.state, created, updated, working_dir
+            "{:<36} {:<20} {:<10} {:<width$} {:<width$} {}",
+            entry.metadata.id,
+            title,
+            entry.metadata.state,
+            created,
+            updated,
+            working_dir,
+            width = time_width
         );
     }
 

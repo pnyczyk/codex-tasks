@@ -1373,13 +1373,13 @@ fn ls_formats_timestamps_in_local_time() {
 
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
     assert!(
-        stdout.contains("May  1 12:34"),
-        "expected created_at to render in Unix style:\n{}",
+        stdout.contains("Wed May  1 12:34:56 2024"),
+        "expected created_at to render in git-style human format:\n{}",
         stdout
     );
     assert!(
-        stdout.contains("May  1 15:40"),
-        "expected updated_at to render in Unix style:\n{}",
+        stdout.contains("Wed May  1 15:40:00 2024"),
+        "expected updated_at to render in git-style human format:\n{}",
         stdout
     );
     assert!(
@@ -1390,6 +1390,35 @@ fn ls_formats_timestamps_in_local_time() {
     assert!(
         !stdout.contains("+00:00"),
         "did not expect timezone offsets in ls output:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn ls_supports_iso_time_format() {
+    let home = tempdir().expect("tempdir");
+    let tasks_root = home.path().join(".codex").join("tasks");
+    let created_at = "2024-05-01T12:34:56Z";
+    let updated_at = "2024-05-01T15:40:00Z";
+    write_metadata_with_timestamps(&tasks_root, "task-iso", "STOPPED", created_at, updated_at);
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    let assert = cmd
+        .env("HOME", home.path())
+        .env("TZ", "UTC")
+        .args(["ls", "--time-format", "iso"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    assert!(
+        stdout.contains("2024-05-01T12:34:56"),
+        "expected created_at to render in ISO format:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("2024-05-01T15:40:00"),
+        "expected updated_at to render in ISO format:\n{}",
         stdout
     );
 }
@@ -1414,18 +1443,49 @@ fn status_formats_timestamps_in_unix_style() {
 
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
     assert!(
-        stdout.contains("Created At: May  1 12:34"),
-        "expected created_at to render in Unix style:\n{}",
+        stdout.contains("Created At: Wed May  1 12:34:56 2024"),
+        "expected created_at to render in git-style human format:\n{}",
         stdout
     );
     assert!(
-        stdout.contains("Updated At: May  1 15:40"),
-        "expected updated_at to render in Unix style:\n{}",
+        stdout.contains("Updated At: Wed May  1 15:40:00 2024"),
+        "expected updated_at to render in git-style human format:\n{}",
         stdout
     );
     assert!(
         !stdout.contains("+00:00"),
         "did not expect timezone offsets in status output:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn status_supports_iso_time_format() {
+    let temp = TempDir::new().expect("temp dir");
+    let home = temp.path();
+    let task_id = "task-iso";
+    let created_at = "2024-05-01T12:34:56Z";
+    let updated_at = "2024-05-01T15:40:00Z";
+    let tasks_root = home.join(".codex").join("tasks");
+    write_metadata_with_timestamps(&tasks_root, task_id, "STOPPED", created_at, updated_at);
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    let assert = cmd
+        .env("HOME", home)
+        .env("TZ", "UTC")
+        .args(["status", "--time-format", "iso", task_id])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    assert!(
+        stdout.contains("Created At: 2024-05-01T12:34:56"),
+        "expected created_at to render in ISO format:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("Updated At: 2024-05-01T15:40:00"),
+        "expected updated_at to render in ISO format:\n{}",
         stdout
     );
 }
