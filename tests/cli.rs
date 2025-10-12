@@ -1373,18 +1373,59 @@ fn ls_formats_timestamps_in_local_time() {
 
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
     assert!(
-        stdout.contains("2024-05-01T12:34:56+00:00"),
-        "expected created_at to use local time without fractional seconds:\n{}",
+        stdout.contains("May  1 12:34"),
+        "expected created_at to render in Unix style:\n{}",
         stdout
     );
     assert!(
-        stdout.contains("2024-05-01T15:40:00+00:00"),
-        "expected updated_at to use local time without fractional seconds:\n{}",
+        stdout.contains("May  1 15:40"),
+        "expected updated_at to render in Unix style:\n{}",
         stdout
     );
     assert!(
         !stdout.contains(".000000"),
         "did not expect fractional seconds in ls output:\n{}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("+00:00"),
+        "did not expect timezone offsets in ls output:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn status_formats_timestamps_in_unix_style() {
+    let temp = TempDir::new().expect("temp dir");
+    let home = temp.path();
+    let task_id = "task-unixtime";
+    let created_at = "2024-05-01T12:34:56Z";
+    let updated_at = "2024-05-01T15:40:00Z";
+    let tasks_root = home.join(".codex").join("tasks");
+    write_metadata_with_timestamps(&tasks_root, task_id, "STOPPED", created_at, updated_at);
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    let assert = cmd
+        .env("HOME", home)
+        .env("TZ", "UTC")
+        .args(["status", task_id])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    assert!(
+        stdout.contains("Created At: May  1 12:34"),
+        "expected created_at to render in Unix style:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("Updated At: May  1 15:40"),
+        "expected updated_at to render in Unix style:\n{}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("+00:00"),
+        "did not expect timezone offsets in status output:\n{}",
         stdout
     );
 }

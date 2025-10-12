@@ -5,6 +5,7 @@ use serde_json::json;
 
 use crate::storage::TaskStore;
 use crate::task::{TaskId, TaskMetadata, TaskState};
+use crate::timefmt::format_unix_style;
 
 /// Output format supported by the status command.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,8 +46,14 @@ fn render_human(record: &TaskStatusRecord) {
         println!("Title: {}", title);
     }
     println!("State: {}", record.metadata.state);
-    println!("Created At: {}", record.metadata.created_at.to_rfc3339());
-    println!("Updated At: {}", record.metadata.updated_at.to_rfc3339());
+    println!(
+        "Created At: {}",
+        format_unix_style(record.metadata.created_at)
+    );
+    println!(
+        "Updated At: {}",
+        format_unix_style(record.metadata.updated_at)
+    );
     match record.metadata.working_dir.as_deref() {
         Some(dir) => println!("Working Dir: {}", dir),
         None => println!("Working Dir: <none>"),
