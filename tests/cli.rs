@@ -905,7 +905,7 @@ struct IntegrationTestEnv {
 
 impl IntegrationTestEnv {
     fn new() -> Self {
-        Self::with_optional_delay(None)
+        Self::with_optional_delay(Some(200))
     }
 
     fn with_delay(delay_ms: u64) -> Self {

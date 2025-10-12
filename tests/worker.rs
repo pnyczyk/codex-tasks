@@ -33,6 +33,7 @@ fn worker_subcommand_writes_pid_file() {
         .arg("Integration Title")
         .env("PATH", &path_value)
         .env("HOME", tmp.path())
+        .env("FAKE_CODEX_ROOT", tmp.path())
         .stdout(std::process::Stdio::piped())
         .spawn()
         .expect("spawn worker");
