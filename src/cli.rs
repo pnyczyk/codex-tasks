@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
 use crate::task::TaskState;
+use crate::timefmt::TimeFormat;
 
 /// Top-level CLI definition for the `codex-tasks` binary.
 #[derive(Debug, Parser)]
@@ -78,6 +79,9 @@ pub struct StatusArgs {
     /// Emit machine-readable JSON output.
     #[arg(long)]
     pub json: bool,
+    /// Control how timestamps are rendered when using human-readable output.
+    #[arg(long = "time-format", value_enum, default_value_t = TimeFormat::Human)]
+    pub time_format: TimeFormat,
     /// Identifier of the task that should be inspected.
     pub task_id: String,
 }
@@ -125,6 +129,9 @@ pub struct LsArgs {
     /// Include archived tasks in the listing.
     #[arg(short = 'a', long = "all")]
     pub include_archived: bool,
+    /// Control how timestamps are rendered in the listing.
+    #[arg(long = "time-format", value_enum, default_value_t = TimeFormat::Human)]
+    pub time_format: TimeFormat,
 }
 
 /// Arguments for the `archive` subcommand.

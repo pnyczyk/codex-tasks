@@ -12,5 +12,6 @@ pub fn handle_status(args: StatusArgs) -> Result<()> {
     crate::status::run(StatusCommandOptions {
         task_id: args.task_id,
         format,
+        time_format: args.time_format,
     })
 }
