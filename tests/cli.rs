@@ -1042,6 +1042,30 @@ fn write_metadata(tasks_dir: &Path, task_id: &str, state: &str) {
     .expect("write metadata");
 }
 
+fn write_metadata_with_timestamps(
+    tasks_dir: &Path,
+    task_id: &str,
+    state: &str,
+    created_at: &str,
+    updated_at: &str,
+) {
+    let task_dir = tasks_dir.join(task_id);
+    fs::create_dir_all(&task_dir).expect("task directory");
+    let metadata_path = task_dir.join("task.json");
+    let payload = json!({
+        "id": task_id,
+        "title": "Example task",
+        "state": state,
+        "created_at": created_at,
+        "updated_at": updated_at,
+    });
+    fs::write(
+        metadata_path,
+        serde_json::to_string_pretty(&payload).expect("serialize metadata"),
+    )
+    .expect("write metadata");
+}
+
 fn create_pipe(path: &Path) {
     if path.exists() {
         fs::remove_file(path).expect("remove existing pipe");
@@ -1329,6 +1353,40 @@ fn log_follow_waits_for_log_file_creation() {
 
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
     assert_eq!(stdout, "line one\nline two\n");
+}
+
+#[test]
+fn ls_formats_timestamps_in_local_time() {
+    let home = tempdir().expect("tempdir");
+    let tasks_root = home.path().join(".codex").join("tasks");
+    let created_at = "2024-05-01T12:34:56Z";
+    let updated_at = "2024-05-01T15:40:00Z";
+    write_metadata_with_timestamps(&tasks_root, "task-local", "STOPPED", created_at, updated_at);
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    let assert = cmd
+        .env("HOME", home.path())
+        .env("TZ", "UTC")
+        .arg("ls")
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    assert!(
+        stdout.contains("2024-05-01T12:34:56+00:00"),
+        "expected created_at to use local time without fractional seconds:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("2024-05-01T15:40:00+00:00"),
+        "expected updated_at to use local time without fractional seconds:\n{}",
+        stdout
+    );
+    assert!(
+        !stdout.contains(".000000"),
+        "did not expect fractional seconds in ls output:\n{}",
+        stdout
+    );
 }
 
 #[test]

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use chrono::{Local, SecondsFormat};
 
 use crate::cli::LsArgs;
 use crate::commands::tasks::{collect_active_tasks, collect_archived_tasks};
@@ -32,8 +33,8 @@ pub fn handle_ls(args: LsArgs) -> Result<()> {
     );
     for entry in tasks {
         let title = entry.metadata.title.as_deref().unwrap_or("-");
-        let created = entry.metadata.created_at.to_rfc3339();
-        let updated = entry.metadata.updated_at.to_rfc3339();
+        let created = format_local_timestamp(entry.metadata.created_at);
+        let updated = format_local_timestamp(entry.metadata.updated_at);
         let working_dir = entry.metadata.working_dir.as_deref().unwrap_or("-");
         println!(
             "{:<36}  {:<20}  {:<10}  {:<25}  {:<25}  {}",
@@ -42,4 +43,10 @@ pub fn handle_ls(args: LsArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn format_local_timestamp(value: chrono::DateTime<chrono::Utc>) -> String {
+    value
+        .with_timezone(&Local)
+        .to_rfc3339_opts(SecondsFormat::Secs, false)
 }
