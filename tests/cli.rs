@@ -852,7 +852,10 @@ fn end_to_end_task_lifecycle_flow() {
     let value: Value = serde_json::from_slice(&output).expect("valid json");
     assert_eq!(value["state"], "STOPPED");
     assert_eq!(value["last_result"], "response 2: second prompt");
-    assert_eq!(value["location"], "active");
+    let working_dir = value["working_dir"]
+        .as_str()
+        .expect("working_dir recorded")
+        .to_string();
 
     let mut log = env.command();
     log.args(["log", "-n", "20", &task_id]);
@@ -875,7 +878,7 @@ fn end_to_end_task_lifecycle_flow() {
     archive.assert().success();
 
     let archived = env.wait_for_condition(&task_id, |value| value["state"] == "ARCHIVED");
-    assert_eq!(archived["location"], "archived");
+    assert_eq!(archived["working_dir"].as_str(), Some(working_dir.as_str()));
     assert_eq!(archived["last_result"], "response 2: second prompt");
 }
 
@@ -893,8 +896,28 @@ fn status_reports_died_after_worker_killed() {
     fs::remove_file(&pid_path).expect("remove pid after crash");
 
     let died = env.wait_for_condition(&task_id, |value| value["state"] == "DIED");
-    assert_eq!(died["location"], "active");
+    assert!(died["working_dir"].as_str().is_some());
     assert_eq!(died["last_prompt"], "initial prompt");
+}
+
+#[test]
+fn status_human_output_includes_working_dir() {
+    let env = IntegrationTestEnv::new();
+
+    let task_id = env.start_task("Human Status", "check working dir");
+    let working_dir = env.status_json(&task_id)["working_dir"]
+        .as_str()
+        .expect("working_dir present")
+        .to_string();
+
+    let mut cmd = env.command();
+    let assert = cmd.args(["status", &task_id]).assert().success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+
+    assert!(
+        stdout.contains(&format!("Working Dir: {working_dir}")),
+        "expected stdout to contain working dir {working_dir}, got: {stdout}"
+    );
 }
 
 struct IntegrationTestEnv {
@@ -1083,7 +1106,7 @@ fn status_reports_stopped_task_in_json() {
     assert_eq!(value["id"], task_id);
     assert_eq!(value["title"], "Example task");
     assert_eq!(value["state"], "STOPPED");
-    assert_eq!(value["location"], "active");
+    assert_eq!(value["working_dir"], Value::Null);
     assert_eq!(value["pid"], Value::Null);
     assert_eq!(value["last_prompt"], Value::Null);
 }
@@ -1114,7 +1137,7 @@ fn status_flags_missing_pid_as_died() {
     let output = cmd.assert().success().get_output().stdout.clone();
     let value: Value = serde_json::from_slice(&output).expect("valid json");
     assert_eq!(value["state"], "DIED");
-    assert_eq!(value["location"], "active");
+    assert_eq!(value["working_dir"], Value::Null);
     assert_eq!(value["pid"], Value::Null);
     assert_eq!(value["last_prompt"], Value::Null);
 }
@@ -1153,7 +1176,7 @@ fn status_reports_running_task_when_pid_alive() {
     let value: Value = serde_json::from_slice(&output).expect("valid json");
     assert_eq!(value["state"], "RUNNING");
     assert_eq!(value["pid"], pid);
-    assert_eq!(value["location"], "active");
+    assert_eq!(value["working_dir"], Value::Null);
     assert_eq!(value["last_prompt"], Value::Null);
 
     let _ = child.kill();
@@ -1192,7 +1215,7 @@ fn status_detects_archived_tasks() {
     let output = cmd.assert().success().get_output().stdout.clone();
     let value: Value = serde_json::from_slice(&output).expect("valid json");
     assert_eq!(value["state"], "ARCHIVED");
-    assert_eq!(value["location"], "archived");
+    assert_eq!(value["working_dir"], Value::Null);
     assert_eq!(value["pid"], Value::Null);
     assert_eq!(value["last_result"], "final outcome");
     assert_eq!(value["last_prompt"], Value::Null);
