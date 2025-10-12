@@ -1,5 +1,4 @@
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use serde_json::json;
@@ -37,29 +36,7 @@ pub fn run(options: StatusCommandOptions) -> Result<()> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TaskStatusRecord {
     metadata: TaskMetadata,
-    location: TaskLocation,
     pid: Option<i32>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum TaskLocation {
-    Active(PathBuf),
-    Archived(PathBuf),
-}
-
-impl TaskLocation {
-    fn kind(&self) -> &'static str {
-        match self {
-            TaskLocation::Active(_) => "active",
-            TaskLocation::Archived(_) => "archived",
-        }
-    }
-
-    fn directory(&self) -> &Path {
-        match self {
-            TaskLocation::Active(dir) | TaskLocation::Archived(dir) => dir,
-        }
-    }
 }
 
 fn render_human(record: &TaskStatusRecord) {
@@ -70,11 +47,10 @@ fn render_human(record: &TaskStatusRecord) {
     println!("State: {}", record.metadata.state);
     println!("Created At: {}", record.metadata.created_at.to_rfc3339());
     println!("Updated At: {}", record.metadata.updated_at.to_rfc3339());
-    println!(
-        "Location: {} ({})",
-        record.location.kind(),
-        record.location.directory().display()
-    );
+    match record.metadata.working_dir.as_deref() {
+        Some(dir) => println!("Working Dir: {}", dir),
+        None => println!("Working Dir: <none>"),
+    }
     if let Some(pid) = record.pid {
         println!("PID: {}", pid);
     }
@@ -105,8 +81,7 @@ fn render_json(record: &TaskStatusRecord) -> Result<()> {
         "updated_at": record.metadata.updated_at.clone(),
         "last_prompt": record.metadata.last_prompt.clone(),
         "last_result": record.metadata.last_result.clone(),
-        "location": record.location.kind(),
-        "directory": record.location.directory().display().to_string(),
+        "working_dir": record.metadata.working_dir.clone(),
         "pid": record.pid,
     });
     println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -117,18 +92,13 @@ fn load_status_record(store: &TaskStore, task_id: &str) -> Result<TaskStatusReco
     let paths = store.task(task_id.to_string());
     match paths.read_metadata() {
         Ok(mut metadata) => {
-            let directory = paths.directory().to_path_buf();
             let pid = paths.read_pid()?;
             let derived_state = derive_active_state(&metadata.state, pid);
             metadata.state = derived_state;
             if metadata.last_result.is_none() {
                 metadata.last_result = paths.read_last_result()?;
             }
-            Ok(TaskStatusRecord {
-                metadata,
-                location: TaskLocation::Active(directory),
-                pid,
-            })
+            Ok(TaskStatusRecord { metadata, pid })
         }
         Err(err) => {
             let not_found = err
@@ -147,7 +117,6 @@ fn load_status_record(store: &TaskStore, task_id: &str) -> Result<TaskStatusReco
             }
             Ok(TaskStatusRecord {
                 metadata,
-                location: TaskLocation::Archived(paths.directory().to_path_buf()),
                 pid: None,
             })
         }
