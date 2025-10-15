@@ -37,6 +37,8 @@ pub enum Command {
     Ls(LsArgs),
     /// Archive a completed task.
     Archive(ArchiveArgs),
+    /// Run the MCP server over stdio.
+    Mcp(McpArgs),
     /// Internal entry-point used to run a worker process.
     #[command(hide = true)]
     Worker(WorkerArgs),
@@ -143,6 +145,20 @@ pub struct ArchiveArgs {
     /// Identifier of the task that should be archived.
     #[arg(value_name = "TASK_ID", required_unless_present = "all")]
     pub task_id: Option<String>,
+}
+
+/// Arguments for the `mcp` subcommand.
+#[derive(Debug, Args)]
+pub struct McpArgs {
+    /// Override the store root used for task metadata.
+    #[arg(long = "store-root", value_name = "PATH")]
+    pub store_root: Option<PathBuf>,
+    /// Path to a configuration file that augments the default settings.
+    #[arg(long = "config", value_name = "PATH")]
+    pub config: Option<PathBuf>,
+    /// Allow operations that may modify or stop multiple tasks at once.
+    #[arg(long = "allow-unsafe")]
+    pub allow_unsafe: bool,
 }
 
 /// Hidden arguments used when the CLI binary is re-executed as a worker.

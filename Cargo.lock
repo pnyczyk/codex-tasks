@@ -777,6 +777,7 @@ dependencies = [
  "codex-protocol",
  "dirs 5.0.1",
  "libc",
+ "mcp-types",
  "owo-colors",
  "predicates",
  "serde",
