@@ -12,41 +12,41 @@
 
 2. **File-based metadata layer**
    - Implement helper utilities for `~/.codex/tasks` layout (ensure directories, path helpers).
-   - Implement UUID generation, title storage, timestamps.
-   - Provide read/write APIs for `pid`, `pipe`, `log`, `result` metadata.
+   - Persist Codex `thread_id` values, title storage, and timestamps.
+   - Provide read/write APIs for `pid`, `log`, `result`, and metadata files.
    - **Depends on:** Task 1
 
 3. **Worker process launcher**
    - Implement fork/exec logic that spawns the task worker binary/process.
-   - Worker receives task ID, initial prompt, optional title.
-   - Ensure worker inherits/rendering code from existing `codex-task` implementation.
+   - Worker receives an initial prompt (and optional existing thread ID/title when resuming).
+   - Ensure worker inherits the existing transcript renderer and storage helpers.
    - **Depends on:** Tasks 1 & 2
 
-4. **Worker main loop**
-   - Reuse `codex-task` communication layer to talk to `codex proto`.
-   - Manage `.pipe` lifecycle (open FIFO, handle multiple writers, detect `/quit`).
-   - Stream events into `.log` using existing renderer, update `.result` on completion.
-   - Handle shutdown (`/quit`, stop command, EOF) with timeout + kill.
+4. **Worker invocation flow**
+   - Launch `codex exec --json` for the initial prompt and wait for `thread.started` to provide the canonical identifier.
+   - Buffer early events until the identifier is known, then persist metadata/log files and flush buffered output.
+   - For resumed prompts, call `codex exec --json resume <thread_id>` and append streamed events to the existing log.
+   - Promote the `--output-last-message` artifact into `task.result` and refresh metadata after each invocation.
    - **Depends on:** Task 3
 
 5. **Implement `start` command**
    - Glue CLI + metadata + worker spawn.
-   - Write initial files, start worker, return UUID.
+   - Wait for the worker handshake, then print the Codex `thread_id`.
    - **Depends on:** Tasks 2–4
 
 6. **Implement `send` command**
-   - Open `<task_id>.pipe`, write prompt line, validate task state.
-   - Handle errors (missing pipe ⇒ STOPPED/ARCHIVED/DIED).
+   - Validate task state, ensure no worker is currently running, and spawn a resume worker with the stored `thread_id`.
+   - Handle errors (ARCHIVED/DIED tasks, running worker PIDs, missing metadata).
    - **Depends on:** Task 2
 
 7. **Implement `status` command**
    - Inspect `.pid`, `.log`, `.result`, timestamps.
-   - Detect states (`RUNNING`, `IDLE`, `STOPPED`, `ARCHIVED`, `DIED`).
+   - Detect states (`RUNNING`, `STOPPED`, `ARCHIVED`, `DIED`).
    - Render human-readable summary (JSON/table).
    - **Depends on:** Task 2
 
 8. **Implement `stop` command**
-   - Write `/quit` into task pipe, wait for worker to exit, confirm cleanup.
+   - Signal the worker process, wait for exit with a timeout, and clean up PID metadata.
    - Update metadata/timestamps, handle already-stopped tasks.
    - **Depends on:** Tasks 2 & 4
 
