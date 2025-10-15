@@ -27,6 +27,7 @@ tokio = { version = "1", features = [
 ] }
 uuid = { version = "1", features = ["v4"] }
 libc = "0.2"
+mcp-types = { path = "third_party/codex/codex-rs/mcp-types" }
 tempfile = "3"
 tabwriter = "1"
 

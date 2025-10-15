@@ -1,10 +1,8 @@
-use std::io::ErrorKind;
-
-use anyhow::{Result, bail};
+use anyhow::Result;
 use serde_json::json;
 
-use crate::storage::TaskStore;
-use crate::task::{TaskId, TaskMetadata, TaskState};
+use crate::services::tasks::{TaskService, TaskStatusSnapshot};
+use crate::task::{TaskId, TaskState};
 use crate::timefmt::{TimeFormat, format_time};
 
 /// Output format supported by the status command.
@@ -24,8 +22,8 @@ pub struct StatusCommandOptions {
 
 /// Executes the status command with the provided options.
 pub fn run(options: StatusCommandOptions) -> Result<()> {
-    let store = TaskStore::default()?;
-    let status = load_status_record(&store, &options.task_id)?;
+    let service = TaskService::with_default_store(false)?;
+    let status = service.get_status(&options.task_id)?;
     let time_format = options.time_format;
 
     match options.format {
@@ -36,13 +34,7 @@ pub fn run(options: StatusCommandOptions) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct TaskStatusRecord {
-    metadata: TaskMetadata,
-    pid: Option<i32>,
-}
-
-fn render_human(record: &TaskStatusRecord, time_format: TimeFormat) {
+fn render_human(record: &TaskStatusSnapshot, time_format: TimeFormat) {
     println!("Task ID: {}", record.metadata.id);
     if let Some(title) = &record.metadata.title {
         println!("Title: {}", title);
@@ -81,7 +73,7 @@ fn render_human(record: &TaskStatusRecord, time_format: TimeFormat) {
     }
 }
 
-fn render_json(record: &TaskStatusRecord) -> Result<()> {
+fn render_json(record: &TaskStatusSnapshot) -> Result<()> {
     let payload = json!({
         "id": record.metadata.id.clone(),
         "title": record.metadata.title.clone(),
@@ -95,41 +87,6 @@ fn render_json(record: &TaskStatusRecord) -> Result<()> {
     });
     println!("{}", serde_json::to_string_pretty(&payload)?);
     Ok(())
-}
-
-fn load_status_record(store: &TaskStore, task_id: &str) -> Result<TaskStatusRecord> {
-    let paths = store.task(task_id.to_string());
-    match paths.read_metadata() {
-        Ok(mut metadata) => {
-            let pid = paths.read_pid()?;
-            let derived_state = derive_active_state(&metadata.state, pid);
-            metadata.state = derived_state;
-            if metadata.last_result.is_none() {
-                metadata.last_result = paths.read_last_result()?;
-            }
-            Ok(TaskStatusRecord { metadata, pid })
-        }
-        Err(err) => {
-            let not_found = err
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|io_err| io_err.kind() == ErrorKind::NotFound);
-            if !not_found {
-                return Err(err);
-            }
-
-            let Some((paths, mut metadata)) = store.find_archived_task(task_id)? else {
-                bail!("task {task_id} was not found in the task store");
-            };
-            metadata.state = TaskState::Archived;
-            if metadata.last_result.is_none() {
-                metadata.last_result = paths.read_last_result()?;
-            }
-            Ok(TaskStatusRecord {
-                metadata,
-                pid: None,
-            })
-        }
-    }
 }
 
 pub(crate) fn derive_active_state(metadata_state: &TaskState, pid: Option<i32>) -> TaskState {

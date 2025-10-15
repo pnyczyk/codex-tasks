@@ -1,5 +1,7 @@
 mod cli;
 mod commands;
+mod mcp;
+mod services;
 mod status;
 pub mod storage;
 pub mod task;
@@ -25,6 +27,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::Stop(args) => commands::handle_stop(args),
         Command::Ls(args) => commands::handle_ls(args),
         Command::Archive(args) => commands::handle_archive(args),
+        Command::Mcp(args) => mcp::run(args),
         Command::Worker(args) => commands::handle_worker(args),
     }
 }
