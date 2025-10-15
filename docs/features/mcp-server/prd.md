@@ -11,7 +11,7 @@ Introduce a minimal `codex-tasks mcp` subcommand that runs codex-tasks itself as
 
 ## Goals & Success Metrics
 1. Provide a single command `codex-tasks mcp` that turns the binary into a long-lived MCP server speaking over stdio.
-2. Surface a curated set of MCP tools that map 1:1 to codex task operations (e.g., `task.start`, `task.send`, `task.status`, `task.log`, `task.stop`, `task.list`, `task.archive`).
+2. Surface a curated set of MCP tools that map 1:1 to codex task operations (e.g., `task_start`, `task_send`, `task_status`, `task_log`, `task_stop`, `task_list`, `task_archive`).
 3. Support streaming responses where the underlying CLI already supports streaming (notably task logs).
 4. Keep configuration lightweight—primarily store root overrides, optional feature flags, and authentication hooks for future growth.
 
@@ -26,8 +26,8 @@ Success criteria:
 - No redesign of codex storage; the server uses the same TaskStore as the CLI.
 
 ## User Stories
-1. *As an IDE integration developer*, I can launch `codex-tasks mcp` in the background and call `task.start` from my MCP client to kick off a Codex worker.
-2. *As an automation engineer*, I can stream logs by invoking the `task.log` MCP tool and receiving incremental outputs without re-running the CLI repeatedly.
+1. *As an IDE integration developer*, I can launch `codex-tasks mcp` in the background and call `task_start` from my MCP client to kick off a Codex worker.
+2. *As an automation engineer*, I can stream logs by invoking the `task_log` MCP tool and receiving incremental outputs without re-running the CLI repeatedly.
 3. *As a maintainer*, I can audit the exposed tool list and ensure permission gating aligns with existing CLI behavior.
 
 ## Functional Requirements
@@ -39,7 +39,7 @@ codex-tasks mcp [--store-root <PATH>] [--config <PATH>] [--allow-unsafe]
 - Without arguments the server reads/writes `~/.codex/tasks` as usual.
 - `--store-root` lets operators point to an alternate task store.
 - `--config` references an optional TOML file containing server settings (tool enablement, auth token, logging verbosity).
-- `--allow-unsafe` (placeholder) can gate operations such as executing `task.stop -a` if we decide to restrict them by default.
+- `--allow-unsafe` (placeholder) can gate operations such as executing `task_stop --all` if we decide to restrict them by default.
 
 The process binds stdio to MCP. It should log a brief startup banner to stderr (for operator clarity) but never emit non-MCP data on stdout.
 
@@ -48,20 +48,20 @@ Expose the following MCP tools (tentative names, subject to alignment with proto
 
 | Tool ID       | Description                                    | Input payload                                         | Output payload                                     |
 |---------------|------------------------------------------------|-------------------------------------------------------|----------------------------------------------------|
-| `task.start`  | Starts a new Codex task                         | Initial prompt, optional title/config/working_dir     | Task metadata incl. thread_id                      |
-| `task.send`   | Sends a follow-up prompt to a task              | task_id, prompt                                       | Updated metadata (last prompt timestamp, etc.)     |
-| `task.status` | Returns current status for a task               | task_id                                               | Task state, timestamps, last result preview        |
-| `task.log`    | Streams log lines for a task                    | task_id, tail options (lines, follow)                 | Streaming events delivering log chunks             |
-| `task.stop`   | Stops a running task                            | task_id (or flag all?)                                | Outcome summary                                    |
-| `task.list`   | Lists tasks with optional filters               | state filters, include archived flag                  | Array of task summaries                            |
-| `task.archive`| Archives a task                                 | task_id, optional force flag                          | Archive location + confirmation                    |
+| `task_start`  | Starts a new Codex task                         | Initial prompt, optional title/config/working_dir     | Task metadata incl. thread_id                      |
+| `task_send`   | Sends a follow-up prompt to a task              | task_id, prompt                                       | Updated metadata (last prompt timestamp, etc.)     |
+| `task_status` | Returns current status for a task               | task_id                                               | Task state, timestamps, last result preview        |
+| `task_log`    | Streams log lines for a task                    | task_id, tail options (lines, follow)                 | Streaming events delivering log chunks             |
+| `task_stop`   | Stops a running task                            | task_id (or flag all?)                                | Outcome summary                                    |
+| `task_list`   | Lists tasks with optional filters               | state filters, include archived flag                  | Array of task summaries                            |
+| `task_archive`| Archives a task                                 | task_id, optional force flag                          | Archive location + confirmation                    |
 
 Each tool should reuse the existing Rust modules (e.g., `commands::start`, `commands::status`) rather than re-implementing business logic. Inputs/outputs should be serialized as JSON structures conforming to MCP expectations.
 
 ### Protocol Behavior
 - The server implements the MCP Server role, handling `initialize`, `shutdown`, and `ping` according to the spec.
 - Tool invocations execute asynchronously; long-running operations (start, log follow) must send interim events so clients remain responsive.
-- `task.log` in follow mode should emit streaming events until the client cancels the tool invocation.
+- `task_log` in follow mode should emit streaming events until the client cancels the tool invocation.
 - Error responses should embed codex-tasks error codes/messages while using MCP-standard error envelopes.
 
 ### Configuration & Security
@@ -114,6 +114,6 @@ Each tool should reuse the existing Rust modules (e.g., `commands::start`, `comm
 4. Is authentication mandatory for first release, or acceptable as a future enhancement?
 
 ## Acceptance Criteria
-- `codex-tasks mcp` runs an MCP server that successfully handles at least `task.start`, `task.status`, and `task.log` via an automated test client.
+- `codex-tasks mcp` runs an MCP server that successfully handles at least `task_start`, `task_status`, and `task_log` via an automated test client.
 - Documentation enumerates available tools and their payload schemas.
 - Existing CLI functionality remains unchanged; running the command without MCP clients has no side effects beyond stdout/stderr noise.

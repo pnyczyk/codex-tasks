@@ -322,7 +322,7 @@ fn optional_path(value: Option<String>) -> Option<PathBuf> {
 fn build_tools() -> Vec<Tool> {
     vec![
         make_tool(
-            "task.start",
+            "task_start",
             "Start Task",
             "Start a new Codex task worker",
             json!({
@@ -342,7 +342,7 @@ fn build_tools() -> Vec<Tool> {
             true,
         ),
         make_tool(
-            "task.send",
+            "task_send",
             "Send Prompt",
             "Send a follow-up prompt to an existing task",
             json!({
@@ -355,7 +355,7 @@ fn build_tools() -> Vec<Tool> {
             true,
         ),
         make_tool(
-            "task.status",
+            "task_status",
             "Get Status",
             "Retrieve the latest status for a task",
             json!({
@@ -367,7 +367,7 @@ fn build_tools() -> Vec<Tool> {
             false,
         ),
         make_tool(
-            "task.list",
+            "task_list",
             "List Tasks",
             "List tasks stored on disk",
             json!({
@@ -383,7 +383,7 @@ fn build_tools() -> Vec<Tool> {
             false,
         ),
         make_tool(
-            "task.log",
+            "task_log",
             "Read Log",
             "Read recent log output for a task",
             json!({
@@ -396,7 +396,7 @@ fn build_tools() -> Vec<Tool> {
             false,
         ),
         make_tool(
-            "task.stop",
+            "task_stop",
             "Stop Task",
             "Stop a running task or all running tasks",
             json!({
@@ -409,7 +409,7 @@ fn build_tools() -> Vec<Tool> {
             true,
         ),
         make_tool(
-            "task.archive",
+            "task_archive",
             "Archive Task",
             "Archive a stopped task or all completed tasks",
             json!({
@@ -470,13 +470,13 @@ fn handle_tool_call(config: &McpConfig, params: CallToolRequestParams) -> CallTo
     let name = params.name;
     let arguments = params.arguments;
     match name.as_str() {
-        "task.start" => call_task_start(config, arguments),
-        "task.send" => call_task_send(config, arguments),
-        "task.status" => call_task_status(config, arguments),
-        "task.list" => call_task_list(config, arguments),
-        "task.log" => call_task_log(config, arguments),
-        "task.stop" => call_task_stop(config, arguments),
-        "task.archive" => call_task_archive(config, arguments),
+        "task_start" => call_task_start(config, arguments),
+        "task_send" => call_task_send(config, arguments),
+        "task_status" => call_task_status(config, arguments),
+        "task_list" => call_task_list(config, arguments),
+        "task_log" => call_task_log(config, arguments),
+        "task_stop" => call_task_stop(config, arguments),
+        "task_archive" => call_task_archive(config, arguments),
         other => error_text_result(format!("unknown tool '{other}'")),
     }
 }
