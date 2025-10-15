@@ -4,9 +4,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
 
-use crate::status::derive_active_state;
-use crate::storage::{METADATA_FILE_NAME, TaskStore};
-use crate::task::TaskMetadata;
+use crate::tasks::{METADATA_FILE_NAME, TaskMetadata, TaskStore, derive_active_state};
 
 #[derive(Debug)]
 pub(crate) struct ListedTask {
