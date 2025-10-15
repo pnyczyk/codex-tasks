@@ -4,7 +4,7 @@ use anyhow::Result;
 use tabwriter::TabWriter;
 
 use crate::cli::LsArgs;
-use crate::services::tasks::{ListTasksOptions, TaskService};
+use crate::tasks::{ListTasksOptions, TaskService};
 use crate::timefmt::format_time;
 
 pub fn handle_ls(args: LsArgs) -> Result<()> {

@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 
 use crate::cli::ArchiveArgs;
-use crate::services::tasks::{ArchiveAllSummary, ArchiveTaskOutcome, TaskService};
+use crate::tasks::{ArchiveAllSummary, ArchiveTaskOutcome, TaskService};
 
 pub fn handle_archive(args: ArchiveArgs) -> Result<()> {
     let service = TaskService::with_default_store(false)?;

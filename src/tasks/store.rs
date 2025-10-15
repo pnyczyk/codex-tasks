@@ -8,7 +8,7 @@ use chrono::{DateTime, Datelike, Utc};
 use dirs::home_dir;
 use tempfile::NamedTempFile;
 
-use crate::task::{TaskId, TaskMetadata};
+use crate::tasks::{TaskId, TaskMetadata};
 
 const ARCHIVE_DIR_NAME: &str = "archive";
 
@@ -383,7 +383,7 @@ mod tests {
         let metadata = TaskMetadata::new(
             id.clone(),
             Some("Example".into()),
-            crate::task::TaskState::Stopped,
+            crate::tasks::TaskState::Stopped,
         );
         files.write_metadata(&metadata).expect("write metadata");
         let loaded = files.read_metadata().expect("read metadata");
@@ -474,7 +474,7 @@ mod tests {
             .ensure_archive_task_dir(timestamp, &task_id)
             .expect("archive dir");
         let paths = TaskPaths::from_directory(archive_dir, task_id.clone());
-        let metadata = TaskMetadata::new(task_id.clone(), None, crate::task::TaskState::Stopped);
+        let metadata = TaskMetadata::new(task_id.clone(), None, crate::tasks::TaskState::Stopped);
         paths
             .write_metadata(&metadata)
             .expect("write archived metadata");

@@ -1,10 +1,7 @@
 mod cli;
 mod commands;
 mod mcp;
-mod services;
-mod status;
-pub mod storage;
-pub mod task;
+pub mod tasks;
 mod timefmt;
 pub mod worker;
 

@@ -11,8 +11,7 @@ use tokio::fs::OpenOptions as TokioOpenOptions;
 use tokio::io::{self as tokio_io, AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::Command;
 
-use crate::storage::{TaskPaths, TaskStore};
-use crate::task::{TaskId, TaskMetadata, TaskState};
+use crate::tasks::{TaskId, TaskMetadata, TaskPaths, TaskState, TaskStore};
 
 pub const TITLE_ENV_VAR: &str = "CODEX_TASK_TITLE";
 pub const PROMPT_ENV_VAR: &str = "CODEX_TASK_PROMPT";

@@ -17,13 +17,11 @@ use serde_json::{Value as JsonValue, json};
 use toml::Value as TomlValue;
 
 use crate::cli::McpArgs;
-use crate::services::tasks::{
+use crate::tasks::{
     ArchiveAllSummary, ArchiveTaskOutcome, FollowMetadata, ListTasksOptions, LogDescriptor,
-    SendPromptParams, StartTaskParams, StopOutcome, StopTaskReport, TaskListEntry, TaskService,
-    TaskStatusSnapshot,
+    SendPromptParams, StartTaskParams, StopOutcome, StopTaskReport, TaskListEntry, TaskMetadata,
+    TaskService, TaskState, TaskStatusSnapshot, TaskStore,
 };
-use crate::storage::TaskStore;
-use crate::task::{TaskMetadata, TaskState};
 
 const DEFAULT_LOG_TAIL: usize = 200;
 

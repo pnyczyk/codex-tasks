@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use crate::cli::SendArgs;
-use crate::services::tasks::{SendPromptParams, TaskService};
+use crate::tasks::{SendPromptParams, TaskService};
 
 pub fn handle_send(args: SendArgs) -> Result<()> {
     let service = TaskService::with_default_store(false)?;

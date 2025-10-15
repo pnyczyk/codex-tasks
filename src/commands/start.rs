@@ -3,7 +3,7 @@ use std::io::{self, Read};
 use anyhow::{Context, Result, bail};
 
 use crate::cli::StartArgs;
-use crate::services::tasks::{StartTaskParams, TaskService};
+use crate::tasks::{StartTaskParams, TaskService};
 
 pub fn handle_start(args: StartArgs) -> Result<()> {
     let StartArgs {

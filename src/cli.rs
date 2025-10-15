@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
-use crate::task::TaskState;
+use crate::tasks::TaskState;
 use crate::timefmt::TimeFormat;
 
 /// Top-level CLI definition for the `codex-tasks` binary.

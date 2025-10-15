@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use crate::cli::StopArgs;
-use crate::services::tasks::{StopOutcome, TaskService};
+use crate::tasks::{StopOutcome, TaskService};
 
 pub fn handle_stop(args: StopArgs) -> Result<()> {
     let service = TaskService::with_default_store(false)?;

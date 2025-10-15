@@ -9,8 +9,7 @@ use codex_protocol::num_format::format_with_separators;
 use serde_json::Value;
 
 use crate::cli::LogArgs;
-use crate::services::tasks::{FollowMetadata, TaskService};
-use crate::task::TaskState;
+use crate::tasks::{FollowMetadata, TaskService, TaskState};
 
 pub fn handle_log(args: LogArgs) -> Result<()> {
     let service = TaskService::with_default_store(false)?;
