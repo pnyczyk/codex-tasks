@@ -1,22 +1,22 @@
 use std::collections::VecDeque;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, BufRead, BufReader, ErrorKind, Write};
-use std::path::PathBuf;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use codex_protocol::num_format::format_with_separators;
 use serde_json::Value;
 
 use crate::cli::LogArgs;
-use crate::storage::{LOG_FILE_NAME, TaskStore};
+use crate::services::tasks::{FollowMetadata, TaskService};
 use crate::task::TaskState;
 
 pub fn handle_log(args: LogArgs) -> Result<()> {
-    let store = TaskStore::default()?;
+    let service = TaskService::with_default_store(false)?;
     let wait_for_log = args.follow || args.forever;
-    let log_path = resolve_log_path(&store, &args.task_id, wait_for_log)?;
+    let descriptor = service.prepare_log_descriptor(&args.task_id, wait_for_log)?;
+    let log_path = descriptor.path.clone();
     let file = File::open(&log_path).with_context(|| {
         format!(
             "failed to open log for task {} at {}",
@@ -30,10 +30,9 @@ pub fn handle_log(args: LogArgs) -> Result<()> {
 
         let should_follow = args.follow || args.forever;
         if should_follow {
-            let metadata = resolve_follow_metadata(&store, &args.task_id)?;
             let context = FollowContext {
                 task_id: args.task_id,
-                metadata,
+                metadata: descriptor.metadata.clone(),
                 forever: args.forever,
             };
             follow_log(&mut reader, context)?;
@@ -44,98 +43,15 @@ pub fn handle_log(args: LogArgs) -> Result<()> {
 
         let should_follow = args.follow || args.forever;
         if should_follow {
-            let metadata = resolve_follow_metadata(&store, &args.task_id)?;
             let context = FollowContext {
                 task_id: args.task_id,
-                metadata,
+                metadata: descriptor.metadata,
                 forever: args.forever,
             };
             follow_log_human(&mut reader, context, &mut human_state)?;
         }
     }
     Ok(())
-}
-
-fn resolve_log_path(store: &TaskStore, task_id: &str, wait: bool) -> Result<PathBuf> {
-    let active_path = store.task(task_id.to_string()).log_path();
-    let deadline = if wait {
-        Some(Instant::now() + Duration::from_secs(LOG_WAIT_TIMEOUT_SECS))
-    } else {
-        None
-    };
-
-    loop {
-        if active_path.exists() {
-            return Ok(active_path.clone());
-        }
-
-        if let Some(path) = find_archived_log_path(store, task_id)? {
-            return Ok(path);
-        }
-
-        match deadline {
-            Some(limit) if Instant::now() < limit => {
-                thread::sleep(Duration::from_millis(LOG_WAIT_POLL_INTERVAL_MS));
-            }
-            Some(_) | None => {
-                bail!(
-                    "log file for task {task_id} was not found under {} or {}",
-                    store.root().display(),
-                    store.archive_root().display()
-                );
-            }
-        }
-    }
-}
-
-fn find_archived_log_path(store: &TaskStore, task_id: &str) -> Result<Option<PathBuf>> {
-    let archive_root = store.archive_root();
-    if !archive_root.exists() {
-        return Ok(None);
-    }
-
-    let mut stack = vec![archive_root];
-    while let Some(dir) = stack.pop() {
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(err) if err.kind() == ErrorKind::NotFound => continue,
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("failed to read archive directory {}", dir.display())
-                });
-            }
-        };
-
-        for entry in entries {
-            let entry = entry.with_context(|| {
-                format!(
-                    "failed to read entry in archive directory {}",
-                    dir.display()
-                )
-            })?;
-            let path = entry.path();
-            let file_type = entry
-                .file_type()
-                .with_context(|| format!("failed to inspect archive entry {}", path.display()))?;
-
-            if file_type.is_dir() {
-                if path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .map(|name| name == task_id)
-                    .unwrap_or(false)
-                {
-                    let candidate = path.join(LOG_FILE_NAME);
-                    if candidate.exists() {
-                        return Ok(Some(candidate));
-                    }
-                }
-                stack.push(path);
-            }
-        }
-    }
-
-    Ok(None)
 }
 
 fn print_initial_log(reader: &mut BufReader<File>, limit: Option<usize>) -> Result<()> {
@@ -619,13 +535,6 @@ fn render_file_change_item(item: &Value) -> Vec<String> {
     lines
 }
 
-#[derive(Clone)]
-enum FollowMetadata {
-    Active { store: TaskStore },
-    Archived { state: TaskState },
-    Missing,
-}
-
 struct FollowContext {
     task_id: String,
     metadata: FollowMetadata,
@@ -654,23 +563,6 @@ impl FollowContext {
     }
 }
 
-fn resolve_follow_metadata(store: &TaskStore, task_id: &str) -> Result<FollowMetadata> {
-    let active_metadata_path = store.task(task_id.to_string()).metadata_path();
-    if active_metadata_path.exists() {
-        return Ok(FollowMetadata::Active {
-            store: store.clone(),
-        });
-    }
-
-    if let Some((_, metadata)) = store.find_archived_task(task_id)? {
-        return Ok(FollowMetadata::Archived {
-            state: metadata.state,
-        });
-    }
-
-    Ok(FollowMetadata::Missing)
-}
-
 fn read_line_retry<R: BufRead>(reader: &mut R, buffer: &mut String) -> io::Result<usize> {
     loop {
         match reader.read_line(buffer) {
@@ -680,6 +572,3 @@ fn read_line_retry<R: BufRead>(reader: &mut R, buffer: &mut String) -> io::Resul
         }
     }
 }
-
-const LOG_WAIT_TIMEOUT_SECS: u64 = 10;
-const LOG_WAIT_POLL_INTERVAL_MS: u64 = 100;
