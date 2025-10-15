@@ -24,7 +24,7 @@
    - **Depends on:** Task 1
 
 4. **Streaming & Concurrency Support**
-   - Extend the adapter for `task.log` to support streaming responses (follow mode with cancellation).
+   - Extend the adapter for `task_log` to support streaming responses (follow mode with cancellation).
    - Ensure long-running operations spawn async tasks with cooperative cancellation.
    - Add client-driven cancellation hooks (e.g., abort handles when MCP issues `cancel`).
    - **Depends on:** Task 3
@@ -44,8 +44,8 @@
    - Build a lightweight MCP client harness (Tokio-based) for integration tests.
    - Write tests covering:
      - Successful `initialize`/`shutdown` lifecycle.
-     - `task.start` + `task.status` round trip.
-     - `task.log` streaming + cancellation.
+     - `task_start` + `task_status` round trip.
+     - `task_log` streaming + cancellation.
    - Add unit tests for config parsing and error mapping.
    - **Depends on:** Tasks 2–4
 
@@ -71,6 +71,6 @@
 
 ## Open Questions
 1. Do we expose advanced CLI flags (repo cloning, JSON output) immediately or phase them in?
-2. Should `task.stop` support `--all` through MCP, and is it gated behind `--allow-unsafe`?
+2. Should `task_stop` support `--all` through MCP, and is it gated behind `--allow-unsafe`?
 3. How do we map CLI stream formatting (ANSI colors, etc.) into MCP responses—strip or preserve?
 4. Do we need metrics (counts, durations) emitted somewhere for ops visibility?
