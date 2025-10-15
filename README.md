@@ -1,6 +1,6 @@
 # codex-tasks
 
-`codex-tasks` is a standalone command-line tool for launching and managing background Codex sessions. Each session (called a "task") spawns a helper process that talks to `codex proto`, records transcripts, and keeps lightweight metadata on disk so you can reconnect at any time.
+`codex-tasks` is a standalone command-line tool for launching and managing background Codex sessions. Each session (called a "task") starts with an initial `codex exec --json` invocation, adopts the returned Codex `thread_id` as its identifier, and records transcripts plus lightweight metadata so you can reconnect at any time.
 
 ## Features
 - **Start tasks** that continue running after the CLI exits and optionally send an initial prompt.
@@ -10,6 +10,7 @@
 - **Stop or archive tasks** to clean up resources and keep historical transcripts organized.
 
 Task data is stored under `~/.codex/tasks/` with per-task directories and a dated archive hierarchy for completed sessions.
+Follow-up prompts reuse the stored `thread_id` and spawn `codex exec resume <thread_id>` invocations, keeping the conversation history intact.
 
 ## Installation
 1. Install the Rust toolchain (Rust 1.78 or newer) using [rustup](https://rustup.rs/).
@@ -32,25 +33,25 @@ The CLI exposes several subcommands; run `codex-tasks <command> --help` for full
 
 | Command | Description |
 | --- | --- |
-| `codex-tasks start [-t <title>] [prompt]` | Create a new task, optionally sending an initial prompt. |
+| `codex-tasks start [-t <title>] <prompt>` | Create a new task with an initial prompt. |
 | `codex-tasks send <task_id> <prompt>` | Send another prompt to an existing task. |
 | `codex-tasks status [--json] <task_id>` | Show live status, metadata, and the last prompt/result. |
 | `codex-tasks log [--json] [-f\|--follow] [--forever] [-n <lines>] <task_id>` | Stream or tail the transcript for a task (human transcript by default, raw JSONL with `--json`). |
-| `codex-tasks stop [-a\|--all] [<task_id>]` | Gracefully shut down a worker; use `-a/--all` to stop every idle task. |
+| `codex-tasks stop [-a\|--all] [<task_id>]` | Gracefully shut down a worker; use `-a/--all` to stop every running task. |
 | `codex-tasks ls [-a\|--all] [--state <STATE> ...]` | List active tasks, optionally including archived ones and filtering by state. |
 | `codex-tasks archive [-a\|--all] [<task_id>]` | Archive a specific task or bulk archive all STOPPED/DIED tasks. |
 
 The `start` subcommand accepts additional flags for tailoring the worker environment:
-- `--config-file PATH` loads a custom `config.toml` for `codex proto` (the file must be named `config.toml`).
-- `--working-dir DIR` runs `codex proto` inside the specified directory, creating it when needed. When omitted, `codex-tasks start` captures the current working directory and reuses it for all subsequent prompts sent to the same task.
+- `--config-file PATH` loads a custom `config.toml` (the file must be named `config.toml`). The worker sets `CODEX_HOME` to the parent directory before launching `codex exec`.
+- `--working-dir DIR` runs `codex exec` inside the specified directory, creating it when needed. When omitted, `codex-tasks start` captures the current working directory and reuses it for subsequent prompts sent to the same task.
 - `--repo URL` clones a Git repository into the working directory before launching the worker (requires `--working-dir`).
 - `--repo-ref REF` checks out the given branch, tag, or commit after cloning the repository.
 
-The `log` command emits the same human-readable transcript as `codex exec` by default; pass `--json` to see the underlying JSONL event stream. The `log -f/--follow` flag exits automatically once the worker returns to `IDLE`, `STOPPED`, or `DIED`. Use `--forever` (or `-F`) to retain the original "follow until interrupted" behavior. The `archive -a/--all` flag bulk-archives every task currently in `STOPPED` or `DIED` state.
+The `log` command emits the same human-readable transcript as `codex exec` by default; pass `--json` to see the underlying JSONL event stream. The `log -f/--follow` flag exits automatically once the current invocation finishes and the task transitions to `STOPPED` or `DIED`. Use `--forever` (or `-F`) to retain the original "follow until interrupted" behavior. The `archive -a/--all` flag bulk-archives every task currently in `STOPPED` or `DIED` state.
 
 ### Typical workflow
 ```bash
-# Start a task with an initial question and capture the generated task ID
+# Start a task with an initial question and capture the generated thread ID
 TASK_ID=$(codex-tasks start -t "Investigate bug" "Why is request latency spiking?")
 
 # Send a follow-up prompt later
@@ -64,7 +65,7 @@ codex-tasks log -f "$TASK_ID"
 
 # Stop and archive when finished
 codex-tasks stop "$TASK_ID"
-codex-tasks stop -a   # stop all remaining idle tasks in bulk
+codex-tasks stop -a   # stop all remaining running tasks in bulk
 codex-tasks archive "$TASK_ID"
 ```
 

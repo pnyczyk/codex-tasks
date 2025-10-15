@@ -48,10 +48,10 @@ pub struct StartArgs {
     /// Optional human readable title for the new task.
     #[arg(short = 't', long)]
     pub title: Option<String>,
-    /// Path to a custom Codex config file that should be used by `codex proto`.
+    /// Path to a custom Codex config file that should be used by `codex exec`.
     #[arg(long = "config-file", value_name = "PATH")]
     pub config_file: Option<PathBuf>,
-    /// Working directory where `codex proto` should run.
+    /// Working directory where `codex exec` should run.
     #[arg(long = "working-dir", value_name = "DIR")]
     pub working_dir: Option<PathBuf>,
     /// Git repository to clone into the working directory before starting.
@@ -163,7 +163,7 @@ pub struct WorkerArgs {
     /// Optional Codex config file that should override the default configuration.
     #[arg(long = "config-path")]
     pub config_path: Option<PathBuf>,
-    /// Optional working directory for launching `codex proto`.
+    /// Optional working directory for launching `codex exec`.
     #[arg(long = "working-dir")]
     pub working_dir: Option<PathBuf>,
 }
