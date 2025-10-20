@@ -84,8 +84,26 @@ pub struct StatusArgs {
     /// Control how timestamps are rendered when using human-readable output.
     #[arg(long = "time-format", value_enum, default_value_t = TimeFormat::Human)]
     pub time_format: TimeFormat,
-    /// Identifier of the task that should be inspected.
-    pub task_id: String,
+    /// Inspect every known task (including archived tasks).
+    #[arg(short = 'a', long = "all", conflicts_with = "all_running")]
+    pub all: bool,
+    /// Inspect every currently running task.
+    #[arg(short = 'A', long = "all-running", conflicts_with = "all")]
+    pub all_running: bool,
+    /// Wait for all selected tasks to reach a terminal state before returning.
+    #[arg(long, conflicts_with = "wait_any")]
+    pub wait: bool,
+    /// Wait until at least one selected task reaches a terminal state before returning.
+    #[arg(long = "wait-any", conflicts_with = "wait")]
+    pub wait_any: bool,
+    /// Identifier(s) of the task(s) that should be inspected.
+    #[arg(
+        value_name = "TASK_ID",
+        num_args = 1..,
+        required_unless_present_any = ["all", "all_running"],
+        conflicts_with_all = ["all", "all_running"]
+    )]
+    pub task_ids: Vec<String>,
 }
 
 /// Arguments for the `log` subcommand.
