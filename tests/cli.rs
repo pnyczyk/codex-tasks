@@ -1246,6 +1246,264 @@ fn status_detects_archived_tasks() {
 }
 
 #[test]
+fn status_supports_multiple_identifiers_in_json() {
+    let env = IntegrationTestEnv::new();
+
+    let first = env.start_task("Status Batch A", "check a");
+    let second = env.start_task("Status Batch B", "check b");
+
+    env.wait_for_condition(&first, |value| value["state"] == "STOPPED");
+    env.wait_for_condition(&second, |value| value["state"] == "STOPPED");
+
+    let mut cmd = env.command();
+    let output = cmd
+        .args(["status", "--json", &first, &second])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&output).expect("valid json");
+
+    let records = value
+        .as_array()
+        .expect("multi-id status should return json array");
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["id"].as_str(), Some(first.as_str()));
+    assert_eq!(records[1]["id"].as_str(), Some(second.as_str()));
+    assert_eq!(records[0]["state"], "STOPPED");
+    assert_eq!(records[1]["state"], "STOPPED");
+}
+
+#[test]
+fn status_all_selector_includes_archived_tasks() {
+    let temp = TempDir::new().expect("temp dir");
+    let home = temp.path();
+    let store_root = home.join(".codex").join("tasks");
+
+    write_metadata(&store_root, "task-active", "STOPPED");
+
+    let archive_dir = store_root
+        .join("archive")
+        .join("2025")
+        .join("10")
+        .join("20")
+        .join("task-archived");
+    fs::create_dir_all(&archive_dir).expect("archive dirs");
+    let timestamp = "2025-10-20T12:00:00Z";
+    let archived_metadata = serde_json::json!({
+        "id": "task-archived",
+        "state": "ARCHIVED",
+        "created_at": timestamp,
+        "updated_at": timestamp
+    });
+    fs::write(
+        archive_dir.join("task.json"),
+        serde_json::to_string_pretty(&archived_metadata).unwrap(),
+    )
+    .expect("archive metadata");
+
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    let output = cmd
+        .env("HOME", home)
+        .args(["status", "--json", "--all"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&output).expect("valid json array");
+    let records = value.as_array().expect("array output");
+
+    assert_eq!(records.len(), 2);
+    let ids: Vec<_> = records
+        .iter()
+        .map(|item| item["id"].as_str().expect("id string"))
+        .collect();
+    assert!(ids.contains(&"task-active"));
+    assert!(ids.contains(&"task-archived"));
+}
+
+#[test]
+fn status_wait_blocks_until_task_reaches_terminal_state() {
+    let temp = TempDir::new().expect("temp dir");
+    let home = temp.path();
+    let store_root = home.join(".codex").join("tasks");
+    let task_id = "task-wait";
+    let timestamp = "2025-10-20T12:00:00Z";
+    let task_dir = store_root.join(task_id);
+    fs::create_dir_all(&task_dir).expect("task dir");
+
+    let running_metadata = serde_json::json!({
+        "id": task_id,
+        "state": "RUNNING",
+        "created_at": timestamp,
+        "updated_at": timestamp
+    });
+    let metadata_path = task_dir.join("task.json");
+    fs::write(
+        &metadata_path,
+        serde_json::to_string_pretty(&running_metadata).unwrap(),
+    )
+    .expect("write running metadata");
+
+    let mut child = StdCommand::new("sleep")
+        .arg("2")
+        .spawn()
+        .expect("spawn sleep");
+    let pid = i32::try_from(child.id()).expect("pid fits in i32");
+    fs::write(task_dir.join("task.pid"), pid.to_string()).expect("pid file");
+
+    let metadata_path_clone = metadata_path.clone();
+    let timestamp_owned = timestamp.to_string();
+    let wait_handle = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(500));
+        let stopped_metadata = serde_json::json!({
+            "id": task_id,
+            "state": "STOPPED",
+            "created_at": timestamp_owned,
+            "updated_at": timestamp_owned
+        });
+        fs::write(
+            &metadata_path_clone,
+            serde_json::to_string_pretty(&stopped_metadata).unwrap(),
+        )
+        .expect("write stopped metadata");
+    });
+
+    let start = Instant::now();
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    let output = cmd
+        .env("HOME", home)
+        .args(["status", "--wait", "--json", task_id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(400),
+        "wait returned too quickly ({elapsed:?})"
+    );
+
+    wait_handle.join().expect("metadata writer finished");
+
+    let value: Value = serde_json::from_slice(&output).expect("valid json");
+    assert_eq!(value["id"].as_str(), Some(task_id));
+    assert_eq!(value["state"], "STOPPED");
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn status_wait_any_returns_when_first_task_completes() {
+    let temp = TempDir::new().expect("temp dir");
+    let home = temp.path();
+    let store_root = home.join(".codex").join("tasks");
+
+    let timestamp = "2025-10-20T12:00:00Z";
+
+    let fast_id = "task-fast";
+    let fast_dir = store_root.join(fast_id);
+    fs::create_dir_all(&fast_dir).expect("fast dir");
+    let fast_metadata = serde_json::json!({
+        "id": fast_id,
+        "state": "RUNNING",
+        "created_at": timestamp,
+        "updated_at": timestamp
+    });
+    fs::write(
+        fast_dir.join("task.json"),
+        serde_json::to_string_pretty(&fast_metadata).unwrap(),
+    )
+    .expect("fast metadata");
+    let mut fast_child = StdCommand::new("sleep")
+        .arg("3")
+        .spawn()
+        .expect("spawn fast sleep");
+    let fast_pid = i32::try_from(fast_child.id()).expect("pid fits");
+    fs::write(fast_dir.join("task.pid"), fast_pid.to_string()).expect("fast pid");
+
+    let slow_id = "task-slow";
+    let slow_dir = store_root.join(slow_id);
+    fs::create_dir_all(&slow_dir).expect("slow dir");
+    let slow_metadata = serde_json::json!({
+        "id": slow_id,
+        "state": "RUNNING",
+        "created_at": timestamp,
+        "updated_at": timestamp
+    });
+    fs::write(
+        slow_dir.join("task.json"),
+        serde_json::to_string_pretty(&slow_metadata).unwrap(),
+    )
+    .expect("slow metadata");
+    let mut slow_child = StdCommand::new("sleep")
+        .arg("5")
+        .spawn()
+        .expect("spawn slow sleep");
+    let slow_pid = i32::try_from(slow_child.id()).expect("pid fits");
+    fs::write(slow_dir.join("task.pid"), slow_pid.to_string()).expect("slow pid");
+
+    let fast_metadata_path = fast_dir.join("task.json");
+    let fast_handle = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(600));
+        let stopped_metadata = serde_json::json!({
+            "id": fast_id,
+            "state": "STOPPED",
+            "created_at": timestamp,
+            "updated_at": timestamp
+        });
+        fs::write(
+            &fast_metadata_path,
+            serde_json::to_string_pretty(&stopped_metadata).unwrap(),
+        )
+        .expect("write fast stopped metadata");
+    });
+
+    let start = Instant::now();
+    let mut cmd = Command::cargo_bin(BIN).expect("binary should build");
+    let output = cmd
+        .env("HOME", home)
+        .args(["status", "--wait-any", "--json", fast_id, slow_id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "wait-any should return before slow task finishes (elapsed={elapsed:?})"
+    );
+
+    fast_handle.join().expect("fast metadata writer finished");
+
+    let value: Value = serde_json::from_slice(&output).expect("valid json");
+    let records = value.as_array().expect("array output");
+    assert_eq!(records.len(), 2);
+
+    let fast_record = records
+        .iter()
+        .find(|item| item["id"].as_str() == Some(fast_id))
+        .expect("fast record present");
+    assert_eq!(fast_record["state"], "STOPPED");
+
+    let slow_record = records
+        .iter()
+        .find(|item| item["id"].as_str() == Some(slow_id))
+        .expect("slow record present");
+    assert_eq!(slow_record["state"], "RUNNING");
+
+    let _ = fast_child.kill();
+    let _ = fast_child.wait();
+    let _ = slow_child.kill();
+    let _ = slow_child.wait();
+}
+
+#[test]
 fn log_displays_entire_file() {
     let home = tempdir().expect("tempdir");
     let task_dir = home.path().join(".codex").join("tasks").join("task-123");

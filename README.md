@@ -35,7 +35,7 @@ The CLI exposes several subcommands; run `codex-tasks <command> --help` for full
 | --- | --- |
 | `codex-tasks start [-t <title>] <prompt>` | Create a new task with an initial prompt. |
 | `codex-tasks send <task_id> <prompt>` | Send another prompt to an existing task. |
-| `codex-tasks status [--json] <task_id>` | Show live status, metadata, and the last prompt/result. |
+| `codex-tasks status [OPTIONS] [<task_id> ...]` | Show status for specific tasks or selectors (supports `-a/--all`, `-A/--all-running`, `--wait`, and `--wait-any`). |
 | `codex-tasks log [--json] [-f\|--follow] [--forever] [-n <lines>] <task_id>` | Stream or tail the transcript for a task (human transcript by default, raw JSONL with `--json`). |
 | `codex-tasks stop [-a\|--all] [<task_id>]` | Gracefully shut down a worker; use `-a/--all` to stop every running task. |
 | `codex-tasks ls [-a\|--all] [--state <STATE> ...]` | List active tasks, optionally including archived ones and filtering by state. |
@@ -67,6 +67,15 @@ codex-tasks log -f "$TASK_ID"
 codex-tasks stop "$TASK_ID"
 codex-tasks stop -a   # stop all remaining running tasks in bulk
 codex-tasks archive "$TASK_ID"
+```
+
+Use the extended status selectors to observe groups of tasks:
+```bash
+# Inspect every running task and wait for at least one to finish
+codex-tasks status --wait-any --all-running
+
+# Render a combined JSON snapshot for several known task IDs
+codex-tasks status --json task-a task-b task-c
 ```
 
 ## Additional documentation
