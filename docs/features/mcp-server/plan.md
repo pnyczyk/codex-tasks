@@ -23,10 +23,12 @@
    - Normalize error handling: map service errors into MCP error envelopes with stable codes.
    - **Depends on:** Task 1
 
-4. **Streaming & Concurrency Support**
-   - Extend the adapter for `task_log` to support streaming responses (follow mode with cancellation).
-   - Ensure long-running operations spawn async tasks with cooperative cancellation.
-   - Add client-driven cancellation hooks (e.g., abort handles when MCP issues `cancel`).
+4. **Resource Subscriptions & Status Updates**
+   - Advertise MCP resource capabilities and register per-task status resources (`task://{id}/status`) alongside a task list resource.
+   - Emit `notifications/resources/list_changed` when tasks are created or archived so controllers discover additions/removals quickly.
+   - Support `resources/subscribe` / `resources/unsubscribe` for task status URIs and fire `notifications/resources/updated` when a subscribed task changes state.
+   - Ensure `resources/read` returns task status snapshots and the current task list for pull-style access.
+   - Drop log follow/streaming mode for now; keep `task_log` as a snapshot-only tool.
    - **Depends on:** Task 3
 
 5. **State & Store Integration**
@@ -45,7 +47,8 @@
    - Write tests covering:
      - Successful `initialize`/`shutdown` lifecycle.
      - `task_start` + `task_status` round trip.
-     - `task_log` streaming + cancellation.
+     - Resource subscription notifications for task status and task list changes.
+     - `resources/read` snapshots and `resources/unsubscribe` behaviour.
    - Add unit tests for config parsing and error mapping.
    - **Depends on:** Tasks 2–4
 
@@ -60,17 +63,17 @@
 2. Config/Auth (Task 2)
 3. Tool Adapters (Task 3)
 4. Store & Logging (Tasks 5 & 6) in parallel once adapters exist
-5. Streaming/Cancellation (Task 4)
+5. Resource Subscriptions (Task 4)
 6. Testing (Task 7)
 7. Docs/Release (Task 8)
 
 ## Risks & Mitigations
 - **Adapter output incompatibility** – some CLI commands write directly to stdout; mitigate by refactoring to accept trait-based writers before wiring adapters.
-- **Streaming back-pressure** – large log outputs could overwhelm clients; add chunking and optional line limits.
+- **Resource notification volume** – frequent status changes could trigger notification storms; add debounce or batching if needed.
 - **Protocol mismatch** – stay aligned with MCP spec; add compatibility tests with the official client library.
 
 ## Open Questions
 1. Do we expose advanced CLI flags (repo cloning, JSON output) immediately or phase them in?
 2. Should `task_stop` support `--all` through MCP, and is it gated behind `--allow-unsafe`?
-3. How do we map CLI stream formatting (ANSI colors, etc.) into MCP responses—strip or preserve?
+3. What payload shape should resource reads use (full snapshot vs. deltas) to keep notifications lightweight?
 4. Do we need metrics (counts, durations) emitted somewhere for ops visibility?
