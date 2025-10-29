@@ -24,10 +24,10 @@
    - **Depends on:** Task 1
 
 4. **Resource Subscriptions & Status Updates**
-   - Advertise MCP resource capabilities and register per-task status resources (`task://{id}/status`) alongside a task list resource.
+   - Advertise MCP resource capabilities and register per-task status resources (`task://{id}/status`).
    - Emit `notifications/resources/list_changed` when tasks are created or archived so controllers discover additions/removals quickly.
    - Support `resources/subscribe` / `resources/unsubscribe` for task status URIs and fire `notifications/resources/updated` when a subscribed task changes state.
-   - Ensure `resources/read` returns task status snapshots and the current task list for pull-style access.
+   - Ensure `resources/read` returns task status snapshots for pull-style access while `resources/list` exposes all known status URIs.
    - Drop log follow/streaming mode for now; keep `task_log` as a snapshot-only tool.
    - **Depends on:** Task 3
 
