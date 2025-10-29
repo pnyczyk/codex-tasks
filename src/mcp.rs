@@ -1248,12 +1248,13 @@ fn format_status_text(status: &TaskStatusSnapshot) -> String {
 }
 
 fn list_to_json(entries: &[TaskListEntry]) -> JsonValue {
-    JsonValue::Array(
-        entries
+    json!({
+        "tasks": entries
             .iter()
             .map(|entry| metadata_to_json(&entry.metadata))
-            .collect(),
-    )
+            .collect::<Vec<_>>(),
+        "count": entries.len(),
+    })
 }
 
 fn metadata_to_json(metadata: &TaskMetadata) -> JsonValue {
