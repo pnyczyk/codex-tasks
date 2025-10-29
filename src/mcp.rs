@@ -1,15 +1,21 @@
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use mcp_types::{
     CallToolRequestParams, CallToolResult, ContentBlock, Implementation, InitializeRequestParams,
     InitializeResult, JSONRPC_VERSION, JSONRPCError, JSONRPCErrorError, JSONRPCMessage,
-    JSONRPCNotification, JSONRPCRequest, JSONRPCResponse, ListToolsResult, MCP_SCHEMA_VERSION,
-    RequestId, ServerCapabilities, ServerCapabilitiesTools, TextContent, Tool, ToolAnnotations,
-    ToolInputSchema,
+    JSONRPCNotification, JSONRPCRequest, JSONRPCResponse, ListResourcesRequestParams,
+    ListResourcesResult, ListToolsResult, MCP_SCHEMA_VERSION, ReadResourceRequestParams,
+    ReadResourceResult, ReadResourceResultContents, RequestId, Resource, ServerCapabilities,
+    ServerCapabilitiesResources, ServerCapabilitiesTools, SubscribeRequestParams, TextContent,
+    TextResourceContents, Tool, ToolAnnotations, ToolInputSchema, UnsubscribeRequestParams,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -24,6 +30,140 @@ use crate::tasks::{
 };
 
 const DEFAULT_LOG_TAIL: usize = 200;
+
+const TASK_URI_PREFIX: &str = "task://";
+const TASK_STATUS_SUFFIX: &str = "/status";
+
+#[derive(Default)]
+struct ResourceState {
+    status_subscriptions: HashMap<String, Option<TaskState>>,
+}
+
+impl ResourceState {
+    fn subscribe(&mut self, uri: &str) -> Result<()> {
+        if let Some(task_id) = parse_task_status_uri(uri) {
+            self.status_subscriptions.entry(task_id).or_insert(None);
+            Ok(())
+        } else {
+            bail!("unsupported resource URI '{uri}'");
+        }
+    }
+
+    fn unsubscribe(&mut self, uri: &str) -> Result<()> {
+        if let Some(task_id) = parse_task_status_uri(uri) {
+            self.status_subscriptions.remove(&task_id);
+            Ok(())
+        } else {
+            bail!("unsupported resource URI '{uri}'");
+        }
+    }
+
+    fn is_status_subscribed(&self, task_id: &str) -> bool {
+        self.status_subscriptions.contains_key(task_id)
+    }
+
+    fn drop_task(&mut self, task_id: &str) {
+        self.status_subscriptions.remove(task_id);
+    }
+
+    fn record_state(&mut self, task_id: &str, state: TaskState) {
+        if let Some(entry) = self.status_subscriptions.get_mut(task_id) {
+            *entry = Some(state);
+        }
+    }
+
+    fn has_subscriptions(&self) -> bool {
+        !self.status_subscriptions.is_empty()
+    }
+
+    fn poll_updates(&mut self, service: &TaskService) -> Vec<ResourceEvent> {
+        if self.status_subscriptions.is_empty() {
+            return Vec::new();
+        }
+
+        let mut events = Vec::new();
+        let mut removed = Vec::new();
+        let task_ids: Vec<String> = self.status_subscriptions.keys().cloned().collect();
+
+        for task_id in task_ids {
+            match service.get_status(&task_id) {
+                Ok(status) => {
+                    let current_state = status.metadata.state.clone();
+                    let entry = self
+                        .status_subscriptions
+                        .entry(task_id.clone())
+                        .or_insert(None);
+                    if entry.as_ref() != Some(&current_state) {
+                        *entry = Some(current_state.clone());
+                        events.push(ResourceEvent::TaskStatusUpdated {
+                            task_id,
+                            new_state: Some(current_state),
+                        });
+                    }
+                }
+                Err(_) => {
+                    removed.push(task_id.clone());
+                }
+            }
+        }
+
+        for task_id in removed {
+            self.status_subscriptions.remove(&task_id);
+            events.push(ResourceEvent::TaskStatusRemoved { task_id });
+        }
+
+        events
+    }
+}
+
+enum ResourceEvent {
+    TaskListChanged,
+    TaskStatusUpdated {
+        task_id: String,
+        new_state: Option<TaskState>,
+    },
+    TaskStatusRemoved {
+        task_id: String,
+    },
+}
+
+fn task_status_uri(task_id: &str) -> String {
+    format!("{TASK_URI_PREFIX}{task_id}{TASK_STATUS_SUFFIX}")
+}
+
+fn parse_task_status_uri(uri: &str) -> Option<String> {
+    let trimmed = uri.strip_prefix(TASK_URI_PREFIX)?;
+    let task_id = trimmed.strip_suffix(TASK_STATUS_SUFFIX)?;
+    if task_id.is_empty() {
+        return None;
+    }
+    Some(task_id.to_string())
+}
+
+fn current_task_state(service: &TaskService, task_id: &str) -> Option<TaskState> {
+    service
+        .get_status(task_id)
+        .map(|status| status.metadata.state)
+        .ok()
+}
+
+struct ToolCallOutput {
+    result: CallToolResult,
+    events: Vec<ResourceEvent>,
+}
+
+impl ToolCallOutput {
+    fn new(result: CallToolResult) -> Self {
+        Self {
+            result,
+            events: Vec::new(),
+        }
+    }
+
+    fn with_events(result: CallToolResult, events: Vec<ResourceEvent>) -> Self {
+        Self { result, events }
+    }
+}
 
 /// Entry point for the `codex-tasks mcp` subcommand.
 pub fn run(args: McpArgs) -> Result<()> {
@@ -69,9 +209,15 @@ impl McpConfig {
     }
 }
 
+enum Incoming {
+    Client(JSONRPCMessage),
+    Tick,
+    StdinClosed,
+}
+
 fn run_server(config: McpConfig) -> Result<()> {
-    let stdin = io::stdin();
     let mut writer = BufWriter::new(io::stdout());
+    let mut resources = ResourceState::default();
 
     if let Some(doc) = config.config_document.as_ref() {
         let top_level = doc.as_table().map(|table| table.len()).unwrap_or_default();
@@ -81,45 +227,106 @@ fn run_server(config: McpConfig) -> Result<()> {
         );
     }
 
-    for line_result in stdin.lock().lines() {
-        let line = line_result.context("failed to read MCP input from stdin")?;
-        if line.trim().is_empty() {
-            continue;
-        }
+    let (tx, rx) = mpsc::channel::<Incoming>();
 
-        let message: JSONRPCMessage = match serde_json::from_str(&line) {
-            Ok(msg) => msg,
-            Err(err) => {
-                eprintln!("[mcp] ignoring malformed message: {err}");
-                continue;
+    {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let stdin = io::stdin();
+            let mut lines = stdin.lock().lines();
+            loop {
+                match lines.next() {
+                    Some(Ok(line)) => {
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        match serde_json::from_str::<JSONRPCMessage>(&line) {
+                            Ok(message) => {
+                                if tx.send(Incoming::Client(message)).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                eprintln!("[mcp] ignoring malformed message: {err}");
+                            }
+                        }
+                    }
+                    Some(Err(err)) => {
+                        eprintln!("[mcp] failed to read MCP input from stdin: {err}");
+                        break;
+                    }
+                    None => break,
+                }
             }
-        };
+            let _ = tx.send(Incoming::StdinClosed);
+        });
+    }
 
-        match message {
-            JSONRPCMessage::Request(request) => {
-                if handle_request(request, &mut writer, &config)? {
+    {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let interval = Duration::from_millis(500);
+            loop {
+                thread::sleep(interval);
+                if tx.send(Incoming::Tick).is_err() {
                     break;
                 }
             }
-            JSONRPCMessage::Notification(notification) => {
-                eprintln!(
-                    "[mcp] ignoring unsupported client notification: {}",
-                    notification.method
-                );
+        });
+    }
+
+    drop(tx);
+
+    while let Ok(message) = rx.recv() {
+        match message {
+            Incoming::Client(message) => {
+                match message {
+                    JSONRPCMessage::Request(request) => {
+                        if handle_request(request, &mut writer, &config, &mut resources)? {
+                            break;
+                        }
+                    }
+                    JSONRPCMessage::Notification(notification) => {
+                        eprintln!(
+                            "[mcp] ignoring unsupported client notification: {}",
+                            notification.method
+                        );
+                    }
+                    JSONRPCMessage::Response(_) | JSONRPCMessage::Error(_) => {
+                        eprintln!("[mcp] ignoring unexpected client response/error");
+                    }
+                }
+                flush_status_updates(&mut writer, &config, &mut resources)?;
             }
-            JSONRPCMessage::Response(_) | JSONRPCMessage::Error(_) => {
-                eprintln!("[mcp] ignoring unexpected client response/error");
+            Incoming::Tick => {
+                flush_status_updates(&mut writer, &config, &mut resources)?;
             }
+            Incoming::StdinClosed => break,
         }
     }
 
     Ok(())
 }
 
+fn flush_status_updates<W: Write>(
+    writer: &mut W,
+    config: &McpConfig,
+    resources: &mut ResourceState,
+) -> Result<()> {
+    if !resources.has_subscriptions() {
+        return Ok(());
+    }
+
+    let service = config.task_service();
+    let events = resources.poll_updates(&service);
+    dispatch_resource_events(writer, resources, events)
+}
+
 fn handle_request<W: Write>(
     request: JSONRPCRequest,
     writer: &mut W,
     config: &McpConfig,
+    resources: &mut ResourceState,
 ) -> Result<bool> {
     let JSONRPCRequest {
         id, method, params, ..
@@ -151,7 +358,10 @@ fn handle_request<W: Write>(
                     experimental: None,
                     logging: None,
                     prompts: None,
-                    resources: None,
+                    resources: Some(ServerCapabilitiesResources {
+                        list_changed: Some(true),
+                        subscribe: Some(true),
+                    }),
                     tools: Some(ServerCapabilitiesTools {
                         list_changed: Some(false),
                     }),
@@ -203,8 +413,99 @@ fn handle_request<W: Write>(
                     return Ok(false);
                 }
             };
-            let result = handle_tool_call(config, params);
+            let output = handle_tool_call(config, params);
+            respond_success(writer, id, serde_json::to_value(&output.result)?)?;
+            dispatch_resource_events(writer, resources, output.events)?;
+            Ok(false)
+        }
+        "resources/list" => {
+            let params_json = params.unwrap_or(JsonValue::Null);
+            let params: Option<ListResourcesRequestParams> =
+                match serde_json::from_value(params_json) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        respond_error(writer, id, -32602, format!("invalid list params: {err}"))?;
+                        return Ok(false);
+                    }
+                };
+            if let Some(params) = params {
+                if params.cursor.is_some() {
+                    respond_error(writer, id, -32602, "cursor is not supported".to_string())?;
+                    return Ok(false);
+                }
+            }
+            let result = list_resources(config)?;
             respond_success(writer, id, serde_json::to_value(result)?)?;
+            Ok(false)
+        }
+        "resources/read" => {
+            let params_json = params.unwrap_or(JsonValue::Null);
+            let params: ReadResourceRequestParams = match serde_json::from_value(params_json) {
+                Ok(value) => value,
+                Err(err) => {
+                    respond_error(writer, id, -32602, format!("invalid read params: {err}"))?;
+                    return Ok(false);
+                }
+            };
+            match read_resource(config, &params.uri) {
+                Ok(result) => respond_success(writer, id, serde_json::to_value(result)?)?,
+                Err(err) => {
+                    respond_error(
+                        writer,
+                        id,
+                        -32000,
+                        format!("failed to read resource: {err:#}"),
+                    )?;
+                }
+            }
+            Ok(false)
+        }
+        "resources/subscribe" => {
+            let params_json = params.unwrap_or(JsonValue::Null);
+            let params: SubscribeRequestParams = match serde_json::from_value(params_json) {
+                Ok(value) => value,
+                Err(err) => {
+                    respond_error(
+                        writer,
+                        id,
+                        -32602,
+                        format!("invalid subscribe params: {err}"),
+                    )?;
+                    return Ok(false);
+                }
+            };
+            match resources.subscribe(&params.uri) {
+                Ok(()) => {
+                    if let Some(task_id) = parse_task_status_uri(&params.uri) {
+                        let service = config.task_service();
+                        if let Ok(status) = service.get_status(&task_id) {
+                            resources.record_state(&task_id, status.metadata.state);
+                        }
+                    }
+                    respond_success(writer, id, json!({ "uri": params.uri }))?
+                }
+                Err(err) => respond_error(writer, id, -32602, err.to_string())?,
+            }
+            Ok(false)
+        }
+        "resources/unsubscribe" => {
+            let params_json = params.unwrap_or(JsonValue::Null);
+            let params: UnsubscribeRequestParams = match serde_json::from_value(params_json) {
+                Ok(value) => value,
+                Err(err) => {
+                    respond_error(
+                        writer,
+                        id,
+                        -32602,
+                        format!("invalid unsubscribe params: {err}"),
+                    )?;
+                    return Ok(false);
+                }
+            };
+            match resources.unsubscribe(&params.uri) {
+                Ok(()) => respond_success(writer, id, json!({ "uri": params.uri }))?,
+                Err(err) => respond_error(writer, id, -32602, err.to_string())?,
+            }
             Ok(false)
         }
         "shutdown" => {
@@ -227,6 +528,136 @@ fn handle_request<W: Write>(
             Ok(false)
         }
     }
+}
+
+fn dispatch_resource_events<W: Write>(
+    writer: &mut W,
+    resources: &mut ResourceState,
+    events: Vec<ResourceEvent>,
+) -> Result<()> {
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    let mut list_changed = false;
+    let mut updated: HashSet<String> = HashSet::new();
+    let mut removed: Vec<String> = Vec::new();
+
+    for event in events {
+        match event {
+            ResourceEvent::TaskListChanged => list_changed = true,
+            ResourceEvent::TaskStatusUpdated { task_id, new_state } => {
+                if let Some(state) = new_state {
+                    resources.record_state(&task_id, state);
+                }
+                updated.insert(task_id);
+            }
+            ResourceEvent::TaskStatusRemoved { task_id } => removed.push(task_id),
+        }
+    }
+
+    for task_id in removed {
+        resources.drop_task(&task_id);
+    }
+
+    if list_changed {
+        send_resource_list_changed(writer)?;
+    }
+
+    for task_id in updated {
+        if resources.is_status_subscribed(&task_id) {
+            let uri = task_status_uri(&task_id);
+            send_resource_updated(writer, &uri)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn send_resource_list_changed<W: Write>(writer: &mut W) -> Result<()> {
+    let notification = JSONRPCNotification {
+        jsonrpc: JSONRPC_VERSION.to_owned(),
+        method: "notifications/resources/list_changed".to_string(),
+        params: None,
+    };
+    write_message(writer, JSONRPCMessage::Notification(notification))
+}
+
+fn send_resource_updated<W: Write>(writer: &mut W, uri: &str) -> Result<()> {
+    let notification = JSONRPCNotification {
+        jsonrpc: JSONRPC_VERSION.to_owned(),
+        method: "notifications/resources/updated".to_string(),
+        params: Some(json!({ "uri": uri })),
+    };
+    write_message(writer, JSONRPCMessage::Notification(notification))
+}
+
+fn list_resources(config: &McpConfig) -> Result<ListResourcesResult> {
+    let service = config.task_service();
+    let entries = service.list_tasks(ListTasksOptions::default())?;
+
+    let mut resources = Vec::with_capacity(entries.len());
+    for entry in entries {
+        resources.push(make_task_status_resource(&entry.metadata));
+    }
+
+    Ok(ListResourcesResult {
+        next_cursor: None,
+        resources,
+    })
+}
+
+fn make_task_status_resource(metadata: &TaskMetadata) -> Resource {
+    let title = metadata
+        .title
+        .clone()
+        .unwrap_or_else(|| format!("Task {}", metadata.id));
+    Resource {
+        annotations: None,
+        description: Some(format!(
+            "Task {} status (state: {}).",
+            metadata.id,
+            metadata.state.as_str()
+        )),
+        mime_type: Some("application/json".to_string()),
+        name: format!("task.status.{}", metadata.id),
+        size: None,
+        title: Some(title),
+        uri: task_status_uri(&metadata.id),
+    }
+}
+
+fn read_resource(config: &McpConfig, uri: &str) -> Result<ReadResourceResult> {
+    if let Some(task_id) = parse_task_status_uri(uri) {
+        return read_task_status_resource(config, &task_id, uri);
+    }
+
+    bail!("unknown resource URI '{uri}'");
+}
+
+fn read_task_status_resource(
+    config: &McpConfig,
+    task_id: &str,
+    uri: &str,
+) -> Result<ReadResourceResult> {
+    let service = config.task_service();
+    let status = service.get_status(task_id)?;
+    let value = status_to_json(&status);
+    make_json_resource_result(uri, value)
+}
+
+fn make_json_resource_result(uri: &str, value: JsonValue) -> Result<ReadResourceResult> {
+    let text = serde_json::to_string_pretty(&value)
+        .with_context(|| format!("failed to encode JSON for resource {uri}"))?;
+    Ok(ReadResourceResult {
+        contents: vec![ReadResourceResultContents::TextResourceContents(
+            TextResourceContents {
+                mime_type: Some("application/json".to_string()),
+                text,
+                uri: uri.to_string(),
+            },
+        )],
+    })
 }
 
 fn respond_success<W: Write>(writer: &mut W, id: RequestId, result: JsonValue) -> Result<()> {
@@ -464,7 +895,7 @@ fn make_tool(
     }
 }
 
-fn handle_tool_call(config: &McpConfig, params: CallToolRequestParams) -> CallToolResult {
+fn handle_tool_call(config: &McpConfig, params: CallToolRequestParams) -> ToolCallOutput {
     let name = params.name;
     let arguments = params.arguments;
     match name.as_str() {
@@ -475,11 +906,11 @@ fn handle_tool_call(config: &McpConfig, params: CallToolRequestParams) -> CallTo
         "task_log" => call_task_log(config, arguments),
         "task_stop" => call_task_stop(config, arguments),
         "task_archive" => call_task_archive(config, arguments),
-        other => error_text_result(format!("unknown tool '{other}'")),
+        other => ToolCallOutput::new(error_text_result(format!("unknown tool '{other}'"))),
     }
 }
 
-fn call_task_start(config: &McpConfig, arguments: Option<JsonValue>) -> CallToolResult {
+fn call_task_start(config: &McpConfig, arguments: Option<JsonValue>) -> ToolCallOutput {
     match parse_arguments::<StartToolArgs>(arguments) {
         Ok(args) => {
             let service = config.task_service();
@@ -493,60 +924,82 @@ fn call_task_start(config: &McpConfig, arguments: Option<JsonValue>) -> CallTool
             };
             match service.start_task(params) {
                 Ok(result) => {
+                    let task_id = result.thread_id.clone();
                     let structured = json!({
                         "threadId": result.thread_id,
                     });
-                    success_text_result(
-                        format!("Task started with thread id {}", result.thread_id),
+                    let text_result = success_text_result(
+                        format!("Task started with thread id {task_id}"),
                         Some(structured),
+                    );
+                    let new_state = current_task_state(&service, &task_id);
+                    ToolCallOutput::with_events(
+                        text_result,
+                        vec![
+                            ResourceEvent::TaskListChanged,
+                            ResourceEvent::TaskStatusUpdated { task_id, new_state },
+                        ],
                     )
                 }
-                Err(err) => error_text_result(format!("Failed to start task: {err:#}")),
+                Err(err) => {
+                    ToolCallOutput::new(error_text_result(format!("Failed to start task: {err:#}")))
+                }
             }
         }
-        Err(err) => error_text_result(err.to_string()),
+        Err(err) => ToolCallOutput::new(error_text_result(err.to_string())),
     }
 }
 
-fn call_task_send(config: &McpConfig, arguments: Option<JsonValue>) -> CallToolResult {
+fn call_task_send(config: &McpConfig, arguments: Option<JsonValue>) -> ToolCallOutput {
     match parse_arguments::<SendToolArgs>(arguments) {
         Ok(args) => {
+            let SendToolArgs { task_id, prompt } = args;
             let service = config.task_service();
             let params = SendPromptParams {
-                task_id: args.task_id,
-                prompt: args.prompt,
+                task_id: task_id.clone(),
+                prompt,
             };
             match service.send_prompt(params) {
-                Ok(()) => success_text_result("Prompt sent successfully", None),
-                Err(err) => error_text_result(format!("Failed to send prompt: {err:#}")),
+                Ok(()) => {
+                    let result = success_text_result("Prompt sent successfully", None);
+                    ToolCallOutput::new(result)
+                }
+                Err(err) => ToolCallOutput::new(error_text_result(format!(
+                    "Failed to send prompt: {err:#}"
+                ))),
             }
         }
-        Err(err) => error_text_result(err.to_string()),
+        Err(err) => ToolCallOutput::new(error_text_result(err.to_string())),
     }
 }
 
-fn call_task_status(config: &McpConfig, arguments: Option<JsonValue>) -> CallToolResult {
+fn call_task_status(config: &McpConfig, arguments: Option<JsonValue>) -> ToolCallOutput {
     match parse_arguments::<StatusToolArgs>(arguments) {
         Ok(args) => {
             let service = config.task_service();
             match service.get_status(&args.task_id) {
                 Ok(status) => {
                     let structured = status_to_json(&status);
-                    success_text_result(format_status_text(&status), Some(structured))
+                    ToolCallOutput::new(success_text_result(
+                        format_status_text(&status),
+                        Some(structured),
+                    ))
                 }
-                Err(err) => error_text_result(format!("Failed to load status: {err:#}")),
+                Err(err) => ToolCallOutput::new(error_text_result(format!(
+                    "Failed to load status: {err:#}"
+                ))),
             }
         }
-        Err(err) => error_text_result(err.to_string()),
+        Err(err) => ToolCallOutput::new(error_text_result(err.to_string())),
     }
 }
 
-fn call_task_list(config: &McpConfig, arguments: Option<JsonValue>) -> CallToolResult {
+fn call_task_list(config: &McpConfig, arguments: Option<JsonValue>) -> ToolCallOutput {
     match parse_arguments::<ListToolArgs>(arguments) {
         Ok(args) => {
             let states = match parse_task_states(&args.states) {
                 Ok(states) => states,
-                Err(err) => return error_text_result(err.to_string()),
+                Err(err) => return ToolCallOutput::new(error_text_result(err.to_string())),
             };
             let service = config.task_service();
             match service.list_tasks(ListTasksOptions {
@@ -556,16 +1009,18 @@ fn call_task_list(config: &McpConfig, arguments: Option<JsonValue>) -> CallToolR
                 Ok(entries) => {
                     let structured = list_to_json(&entries);
                     let text = format_list_text(&entries);
-                    success_text_result(text, Some(structured))
+                    ToolCallOutput::new(success_text_result(text, Some(structured)))
                 }
-                Err(err) => error_text_result(format!("Failed to list tasks: {err:#}")),
+                Err(err) => {
+                    ToolCallOutput::new(error_text_result(format!("Failed to list tasks: {err:#}")))
+                }
             }
         }
-        Err(err) => error_text_result(err.to_string()),
+        Err(err) => ToolCallOutput::new(error_text_result(err.to_string())),
     }
 }
 
-fn call_task_log(config: &McpConfig, arguments: Option<JsonValue>) -> CallToolResult {
+fn call_task_log(config: &McpConfig, arguments: Option<JsonValue>) -> ToolCallOutput {
     match parse_arguments::<LogToolArgs>(arguments) {
         Ok(args) => {
             let service = config.task_service();
@@ -574,41 +1029,58 @@ fn call_task_log(config: &McpConfig, arguments: Option<JsonValue>) -> CallToolRe
                     Ok((lines, state)) => {
                         let structured = log_to_json(&descriptor, &lines, state.clone());
                         let text = format_log_text(&descriptor, &lines, state);
-                        success_text_result(text, Some(structured))
+                        ToolCallOutput::new(success_text_result(text, Some(structured)))
                     }
-                    Err(err) => error_text_result(format!("Failed to read log: {err:#}")),
+                    Err(err) => ToolCallOutput::new(error_text_result(format!(
+                        "Failed to read log: {err:#}"
+                    ))),
                 },
-                Err(err) => error_text_result(format!("Failed to resolve log: {err:#}")),
+                Err(err) => ToolCallOutput::new(error_text_result(format!(
+                    "Failed to resolve log: {err:#}"
+                ))),
             }
         }
-        Err(err) => error_text_result(err.to_string()),
+        Err(err) => ToolCallOutput::new(error_text_result(err.to_string())),
     }
 }
 
-fn call_task_stop(config: &McpConfig, arguments: Option<JsonValue>) -> CallToolResult {
+fn call_task_stop(config: &McpConfig, arguments: Option<JsonValue>) -> ToolCallOutput {
     match parse_arguments::<StopToolArgs>(arguments) {
         Ok(args) => {
             let service = config.task_service();
             if args.all.unwrap_or(false) {
                 match service.stop_all_running() {
                     Ok(reports) => {
+                        let mut events = Vec::new();
+                        for report in &reports {
+                            if report.outcome == StopOutcome::Stopped {
+                                let new_state = current_task_state(&service, &report.task_id);
+                                events.push(ResourceEvent::TaskStatusUpdated {
+                                    task_id: report.task_id.clone(),
+                                    new_state,
+                                });
+                            }
+                        }
                         let structured = stop_reports_to_json(&reports);
-                        if reports.is_empty() {
+                        let result = if reports.is_empty() {
                             success_text_result("No running tasks to stop.", Some(structured))
                         } else {
                             let text = format_stop_reports(&reports);
                             success_text_result(text, Some(structured))
-                        }
+                        };
+                        ToolCallOutput::with_events(result, events)
                     }
-                    Err(err) => error_text_result(format!("Failed to stop tasks: {err:#}")),
+                    Err(err) => ToolCallOutput::new(error_text_result(format!(
+                        "Failed to stop tasks: {err:#}"
+                    ))),
                 }
             } else {
                 let task_id = match args.task_id {
                     Some(id) => id,
                     None => {
-                        return error_text_result(
+                        return ToolCallOutput::new(error_text_result(
                             "`taskId` is required unless `all` is set to true",
-                        );
+                        ));
                     }
                 };
                 match service.stop_task(&task_id) {
@@ -617,20 +1089,32 @@ fn call_task_stop(config: &McpConfig, arguments: Option<JsonValue>) -> CallToolR
                             "taskId": task_id,
                             "outcome": format_stop_outcome(&outcome),
                         });
-                        success_text_result(
+                        let result = success_text_result(
                             format_stop_outcome_text(&task_id, outcome),
                             Some(structured),
-                        )
+                        );
+                        let events = if outcome == StopOutcome::Stopped {
+                            let new_state = current_task_state(&service, &task_id);
+                            vec![ResourceEvent::TaskStatusUpdated {
+                                task_id: task_id.clone(),
+                                new_state,
+                            }]
+                        } else {
+                            Vec::new()
+                        };
+                        ToolCallOutput::with_events(result, events)
                     }
-                    Err(err) => error_text_result(format!("Failed to stop task: {err:#}")),
+                    Err(err) => ToolCallOutput::new(error_text_result(format!(
+                        "Failed to stop task: {err:#}"
+                    ))),
                 }
             }
         }
-        Err(err) => error_text_result(err.to_string()),
+        Err(err) => ToolCallOutput::new(error_text_result(err.to_string())),
     }
 }
 
-fn call_task_archive(config: &McpConfig, arguments: Option<JsonValue>) -> CallToolResult {
+fn call_task_archive(config: &McpConfig, arguments: Option<JsonValue>) -> ToolCallOutput {
     match parse_arguments::<ArchiveToolArgs>(arguments) {
         Ok(args) => {
             let service = config.task_service();
@@ -639,21 +1123,33 @@ fn call_task_archive(config: &McpConfig, arguments: Option<JsonValue>) -> CallTo
                     Ok(summary) => {
                         let structured = archive_summary_to_json(&summary);
                         let text = archive_summary_to_text(&summary);
-                        if summary.failures.is_empty() {
+                        let mut events = Vec::new();
+                        if !summary.archived.is_empty() {
+                            events.push(ResourceEvent::TaskListChanged);
+                            for (task_id, _) in &summary.archived {
+                                events.push(ResourceEvent::TaskStatusRemoved {
+                                    task_id: task_id.clone(),
+                                });
+                            }
+                        }
+                        let result = if summary.failures.is_empty() {
                             success_text_result(text, Some(structured))
                         } else {
                             make_text_result(text, Some(structured), true)
-                        }
+                        };
+                        ToolCallOutput::with_events(result, events)
                     }
-                    Err(err) => error_text_result(format!("Failed to archive tasks: {err:#}")),
+                    Err(err) => ToolCallOutput::new(error_text_result(format!(
+                        "Failed to archive tasks: {err:#}"
+                    ))),
                 }
             } else {
                 let task_id = match args.task_id {
                     Some(id) => id,
                     None => {
-                        return error_text_result(
+                        return ToolCallOutput::new(error_text_result(
                             "`taskId` is required unless `all` is set to true",
-                        );
+                        ));
                     }
                 };
                 match service.archive_task(&task_id) {
@@ -663,20 +1159,34 @@ fn call_task_archive(config: &McpConfig, arguments: Option<JsonValue>) -> CallTo
                             "taskId": id,
                             "destination": destination_str,
                         });
-                        success_text_result(
+                        let result = success_text_result(
                             format!("Task {} archived to {}.", task_id, destination_str),
                             Some(structured),
+                        );
+                        ToolCallOutput::with_events(
+                            result,
+                            vec![
+                                ResourceEvent::TaskListChanged,
+                                ResourceEvent::TaskStatusRemoved {
+                                    task_id: task_id.clone(),
+                                },
+                            ],
                         )
                     }
-                    Ok(ArchiveTaskOutcome::AlreadyArchived { id }) => success_text_result(
-                        format!("Task {} is already archived.", id),
-                        Some(json!({ "taskId": id, "alreadyArchived": true })),
-                    ),
-                    Err(err) => error_text_result(format!("Failed to archive task: {err:#}")),
+                    Ok(ArchiveTaskOutcome::AlreadyArchived { id }) => {
+                        let result = success_text_result(
+                            format!("Task {} is already archived.", id),
+                            Some(json!({ "taskId": id, "alreadyArchived": true })),
+                        );
+                        ToolCallOutput::new(result)
+                    }
+                    Err(err) => ToolCallOutput::new(error_text_result(format!(
+                        "Failed to archive task: {err:#}"
+                    ))),
                 }
             }
         }
-        Err(err) => error_text_result(err.to_string()),
+        Err(err) => ToolCallOutput::new(error_text_result(err.to_string())),
     }
 }
 
@@ -738,12 +1248,13 @@ fn format_status_text(status: &TaskStatusSnapshot) -> String {
 }
 
 fn list_to_json(entries: &[TaskListEntry]) -> JsonValue {
-    JsonValue::Array(
-        entries
+    json!({
+        "tasks": entries
             .iter()
             .map(|entry| metadata_to_json(&entry.metadata))
-            .collect(),
-    )
+            .collect::<Vec<_>>(),
+        "count": entries.len(),
+    })
 }
 
 fn metadata_to_json(metadata: &TaskMetadata) -> JsonValue {
@@ -1162,6 +1673,55 @@ mod tests {
             err.to_string().contains("must be named `config.toml`"),
             "unexpected error: {err:#}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn task_status_uri_round_trip() {
+        let task_id = "task-123";
+        let uri = task_status_uri(task_id);
+        assert_eq!(parse_task_status_uri(&uri), Some(task_id.to_string()));
+        assert!(parse_task_status_uri("task://list").is_none());
+        assert!(parse_task_status_uri("task:///status").is_none());
+    }
+
+    #[test]
+    fn resource_state_subscription_flow() -> Result<()> {
+        let mut state = ResourceState::default();
+        let uri = task_status_uri("demo");
+        state.subscribe(&uri)?;
+        assert!(state.is_status_subscribed("demo"));
+
+        state.unsubscribe(&uri)?;
+        assert!(!state.is_status_subscribed("demo"));
+
+        let err = state.subscribe("task://list").expect_err("expected error");
+        assert!(err.to_string().contains("unsupported resource"));
+        Ok(())
+    }
+
+    #[test]
+    fn dispatch_events_notifies_subscribers() -> Result<()> {
+        let mut state = ResourceState::default();
+        let uri = task_status_uri("demo");
+        state.subscribe(&uri)?;
+
+        let mut buffer = Vec::new();
+        dispatch_resource_events(
+            &mut buffer,
+            &mut state,
+            vec![
+                ResourceEvent::TaskListChanged,
+                ResourceEvent::TaskStatusUpdated {
+                    task_id: "demo".to_string(),
+                    new_state: Some(TaskState::Stopped),
+                },
+            ],
+        )?;
+
+        let payload = String::from_utf8(buffer).expect("utf8");
+        assert!(payload.contains("notifications/resources/list_changed"));
+        assert!(payload.contains(&format!("\"uri\":\"{uri}\"")));
         Ok(())
     }
 }
