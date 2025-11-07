@@ -482,7 +482,16 @@ impl HumanRenderState {
                 input.saturating_sub(cached) + output
             });
 
-        vec!["tokens used".to_string(), format_with_separators(total)]
+        let total_capped = if total > i64::MAX as u64 {
+            i64::MAX
+        } else {
+            total as i64
+        };
+
+        vec![
+            "tokens used".to_string(),
+            format_with_separators(total_capped),
+        ]
     }
 }
 
