@@ -4,7 +4,7 @@ use std::io;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
-use codex_core::protocol::InputMessageKind;
+use serde::Serialize;
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use tokio::fs::OpenOptions as TokioOpenOptions;
@@ -497,14 +497,38 @@ fn user_message_event(prompt: &str) -> Option<String> {
         "message": prompt,
     });
 
-    let kind = InputMessageKind::from(("user", prompt));
-    if !matches!(kind, InputMessageKind::Plain) {
+    let kind = UserPromptKind::from(prompt);
+    if !matches!(kind, UserPromptKind::Plain) {
         if let Ok(kind_value) = serde_json::to_value(kind) {
             value["kind"] = kind_value;
         }
     }
 
     Some(value.to_string())
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum UserPromptKind {
+    Plain,
+    UserInstructions,
+    EnvironmentContext,
+}
+
+impl From<&str> for UserPromptKind {
+    fn from(prompt: &str) -> Self {
+        let trimmed = prompt.trim_start();
+
+        if trimmed.starts_with("<environment_context>") {
+            Self::EnvironmentContext
+        } else if trimmed.starts_with("<user_instructions>")
+            || trimmed.starts_with("# AGENTS.md instructions for ")
+        {
+            Self::UserInstructions
+        } else {
+            Self::Plain
+        }
+    }
 }
 
 enum InvocationKind {
