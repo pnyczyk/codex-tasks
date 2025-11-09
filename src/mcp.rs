@@ -482,7 +482,7 @@ fn handle_request<W: Write>(
                             resources.record_state(&task_id, status.metadata.state);
                         }
                     }
-                    respond_success(writer, id, json!({ "uri": params.uri }))?
+                    respond_success(writer, id, json!({}))?
                 }
                 Err(err) => respond_error(writer, id, -32602, err.to_string())?,
             }
@@ -503,7 +503,7 @@ fn handle_request<W: Write>(
                 }
             };
             match resources.unsubscribe(&params.uri) {
-                Ok(()) => respond_success(writer, id, json!({ "uri": params.uri }))?,
+                Ok(()) => respond_success(writer, id, json!({}))?,
                 Err(err) => respond_error(writer, id, -32602, err.to_string())?,
             }
             Ok(false)
@@ -1723,5 +1723,80 @@ mod tests {
         assert!(payload.contains("notifications/resources/list_changed"));
         assert!(payload.contains(&format!("\"uri\":\"{uri}\"")));
         Ok(())
+    }
+
+    #[test]
+    fn subscribe_response_is_empty_object() -> Result<()> {
+        let (config, _tempdir) = config_with_temp_store()?;
+        let mut resources = ResourceState::default();
+        let message = run_request(
+            &config,
+            &mut resources,
+            "resources/subscribe",
+            json!({ "uri": task_status_uri("demo") }),
+        )?;
+        let response = expect_response(message);
+        assert_eq!(response.result, json!({}));
+        Ok(())
+    }
+
+    #[test]
+    fn unsubscribe_response_is_empty_object() -> Result<()> {
+        let (config, _tempdir) = config_with_temp_store()?;
+        let mut resources = ResourceState::default();
+        run_request(
+            &config,
+            &mut resources,
+            "resources/subscribe",
+            json!({ "uri": task_status_uri("demo") }),
+        )?;
+        let message = run_request(
+            &config,
+            &mut resources,
+            "resources/unsubscribe",
+            json!({ "uri": task_status_uri("demo") }),
+        )?;
+        let response = expect_response(message);
+        assert_eq!(response.result, json!({}));
+        Ok(())
+    }
+
+    fn config_with_temp_store() -> Result<(McpConfig, tempfile::TempDir)> {
+        let tempdir = tempfile::tempdir()?;
+        let config = McpConfig {
+            store: TaskStore::new(tempdir.path().to_path_buf()),
+            config_path: None,
+            config_document: None,
+            allow_unsafe: false,
+        };
+        Ok((config, tempdir))
+    }
+
+    fn run_request(
+        config: &McpConfig,
+        resources: &mut ResourceState,
+        method: &str,
+        params: JsonValue,
+    ) -> Result<JSONRPCMessage> {
+        let mut writer = Vec::new();
+        let request = JSONRPCRequest {
+            id: RequestId::Integer(7),
+            jsonrpc: JSONRPC_VERSION.to_owned(),
+            method: method.to_string(),
+            params: Some(params),
+        };
+        let _ = handle_request(request, &mut writer, config, resources)?;
+        let payload =
+            String::from_utf8(writer).context("failed to decode MCP response as UTF-8")?;
+        let message = serde_json::from_str::<JSONRPCMessage>(payload.trim())
+            .context("failed to parse MCP response JSON")?;
+        Ok(message)
+    }
+
+    fn expect_response(message: JSONRPCMessage) -> JSONRPCResponse {
+        match message {
+            JSONRPCMessage::Response(response) => response,
+            other => panic!("expected JSON-RPC response, got {other:?}"),
+        }
     }
 }
