@@ -381,7 +381,6 @@ fn handle_request<W: Write>(
             };
 
             respond_success(writer, id, serde_json::to_value(result)?)?;
-            send_initialized(writer)?;
             Ok(false)
         }
         "ping" => {
@@ -685,15 +684,6 @@ fn respond_error<W: Write>(
         },
     };
     write_message(writer, JSONRPCMessage::Error(error))
-}
-
-fn send_initialized<W: Write>(writer: &mut W) -> Result<()> {
-    let notification = JSONRPCNotification {
-        jsonrpc: JSONRPC_VERSION.to_owned(),
-        method: "notifications/initialized".to_string(),
-        params: None,
-    };
-    write_message(writer, JSONRPCMessage::Notification(notification))
 }
 
 fn write_message<W: Write>(writer: &mut W, message: JSONRPCMessage) -> Result<()> {
