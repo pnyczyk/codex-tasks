@@ -34,3 +34,7 @@ tabwriter = "1"
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
+
+[patch.crates-io]
+# Align with the codex-rs workspace, which expects rmcp features from this branch.
+rmcp = { git = "https://github.com/bolinfest/rust-sdk", branch = "pr556" }
